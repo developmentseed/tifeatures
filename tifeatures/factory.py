@@ -2,6 +2,8 @@
 
 import json
 import pathlib
+from os import PathLike
+from typing import Union, List, Any
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
@@ -16,16 +18,50 @@ from tifeatures.resources.response import GeoJSONResponse
 from tifeatures.settings import APISettings
 
 from fastapi import APIRouter, Depends, Path, Query
-from fastapi.templating import Jinja2Templates
 
 from starlette.datastructures import QueryParams
 from starlette.requests import Request
 from starlette.responses import HTMLResponse
+from starlette.templating import Jinja2Templates
 
-template_dir = str(pathlib.Path(__file__).parent.joinpath("templates"))
-templates = Jinja2Templates(directory=template_dir)
+import jinja2
+
 settings = APISettings()
 
+class SearchPathTemplates(Jinja2Templates):
+    """
+    templates = DefaultTemplates("templates")
+    return templates.TemplateResponse("index.html", {"request": request})
+    """
+
+    def __init__(
+        self, directory: Union[str, PathLike, List[Union[str, None, PathLike]]], **env_options: Any
+    ) -> None:
+        assert jinja2 is not None, "jinja2 must be installed to use Jinja2Templates"
+        self.env = self._create_env(directory, **env_options)
+
+    def _create_env(
+        self, directory: Union[str, PathLike, List[Union[str, None, PathLike]]], **env_options: Any
+    ) -> "jinja2.Environment":
+        @jinja2.pass_context
+        def url_for(context: dict, name: str, **path_params: Any) -> str:
+            request = context["request"]
+            return request.url_for(name, **path_params)
+
+        if isinstance(directory, list):
+            loader = jinja2.FileSystemLoader([d for d in directory if d])
+        else:
+            loader = jinja2.FileSystemLoader(directory)
+        env_options.setdefault("loader", loader)
+        env_options.setdefault("autoescape", True)
+
+        env = jinja2.Environment(**env_options)
+        env.globals["url_for"] = url_for
+        return env
+
+
+default_template_dir = str(pathlib.Path(__file__).parent.joinpath("templates"))
+templates = SearchPathTemplates(directory=[settings.template_directory, default_template_dir])
 
 def create_html_response(
     request: Request, data: str, template_name: str
