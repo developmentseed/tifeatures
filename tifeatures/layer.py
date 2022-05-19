@@ -2,10 +2,10 @@
 
 import abc
 from dataclasses import dataclass
-from typing import Any, ClassVar, Dict, List, Optional
+from typing import Any, Callable, ClassVar, Dict, List, Optional
 
 from buildpg import Var as pg_variable
-from buildpg import asyncpg, clauses
+from buildpg import asyncpg, clauses, S
 from buildpg import funcs as pg_funcs
 from buildpg import render
 from geojson_pydantic import Feature, FeatureCollection
@@ -54,139 +54,6 @@ class CollectionLayer(BaseModel, metaclass=abc.ABCMeta):
         """Return a Feature."""
         ...
 
-
-class Table(CollectionLayer):
-    """Table Reader.
-
-    Attributes:
-        id (str): Layer's name.
-        bounds (list): Layer's bounds (left, bottom, right, top).
-        type (str): Layer's type.
-        schema (str): Table's database schema (e.g public).
-        geometry_type (str): Table's geometry type (e.g polygon).
-        srid (int): Table's SRID
-        geometry_column (str): Name of the geomtry column in the table.
-        properties (Dict): Properties available in the table.
-
-    """
-
-    type: str = "Table"
-    dbschema: str = Field(..., alias="schema")
-    table: str
-    geometry_type: str
-    geometry_column: str
-    geometry_srid: int
-    id_column: str
-    properties: Dict[str, Dict[str, Any]]
-
-    async def features(
-        self,
-        pool: asyncpg.BuildPgPool,
-        limit: Optional[int] = None,
-        offset: Optional[int] = None,
-        **kwargs: Any,
-    ) -> Items:
-        """Return a FeatureCollection."""
-
-        limit = limit or 10
-        offset = offset or 0
-
-        async with pool.acquire() as conn:
-            sql_query = """
-                WITH
-                    features AS (
-                        SELECT
-                        *
-                        FROM :tablename
-                        -- TODO: WHERE
-                        -- TODO: SORT
-                        LIMIT :limit OFFSET :offset
-                    ),
-                    total_count AS (
-                        SELECT COUNT(*) FROM :tablename
-                    )
-                SELECT json_build_object(
-                    'type', 'FeatureCollection',
-                    'features', json_agg(
-                        json_build_object(
-                            'type', 'Feature',
-                            'id', :id_column,
-                            'geometry', ST_AsGeoJSON(
-                                CASE
-                                    WHEN :srid = 4326 THEN :geometry_column
-                                    ELSE ST_Transform(:geometry_column, 4326)
-                                END
-                                )::json,
-                            'properties', to_jsonb( features.* ) - :geometry_column_str
-                        )
-                    ),
-                    'total_count', total_count.count
-                )
-                FROM features, total_count
-                GROUP BY total_count.count;
-            """
-
-            q, p = render(
-                sql_query,
-                tablename=pg_variable(self.id),
-                id_column=pg_variable(self.id_column),
-                geometry_column=pg_variable(self.geometry_column),
-                geometry_column_str=self.geometry_column,
-                srid=self.geometry_srid,
-                limit=limit,
-                offset=offset,
-            )
-
-            return await conn.fetchval(q, *p)
-
-    async def feature(
-        self,
-        pool: asyncpg.BuildPgPool,
-        item_id: str,
-    ) -> Feature:
-        """Return a Feature."""
-        async with pool.acquire() as conn:
-            sql_query = """
-                WITH
-                features AS (
-                    SELECT *
-                    FROM :tablename t
-                    :where_logic
-                    LIMIT 1
-                )
-                SELECT
-                    json_build_object(
-                            'type', 'Feature',
-                            'id', :id_column,
-                            'geometry', ST_AsGeoJSON(
-                                CASE
-                                    WHEN :srid = 4326 THEN :geometry_column
-                                    ELSE ST_Transform(:geometry_column, 4326)
-                                END
-                                )::json,
-                            'properties', to_jsonb( features.* ) - :geometry_column_str
-                        )
-                FROM features
-            """
-            where_logic = clauses.Where(
-                pg_variable(self.id_column)
-                == pg_funcs.cast(
-                    pg_funcs.cast(item_id, "text"),
-                    self.properties[self.id_column]["type"],
-                )
-            )
-
-            q, p = render(
-                sql_query,
-                tablename=pg_variable(self.id),
-                id_column=pg_variable(self.id_column),
-                geometry_column=pg_variable(self.geometry_column),
-                geometry_column_str=self.geometry_column,
-                srid=self.geometry_srid,
-                where_logic=where_logic,
-            )
-
-            return await conn.fetchval(q, *p)
 
 
 class Function(CollectionLayer):

@@ -1,6 +1,7 @@
 """tifeatures.factory: router factories."""
 
 import json
+import orjson
 import pathlib
 from dataclasses import dataclass, field
 from typing import Any, Callable, List, Optional
@@ -11,12 +12,16 @@ from tifeatures.dependencies import (
     OutputType,
     bbox_query,
     datetime_query,
+    filter_query,
+    properties_query,
 )
 from tifeatures.errors import NotFound
 from tifeatures.layer import CollectionLayer
 from tifeatures.resources.enums import MediaType, ResponseType
 from tifeatures.resources.response import GeoJSONResponse
 from tifeatures.settings import APISettings
+from tifeatures.filter.filters import quote_ident
+from tifeatures.filter.evaluate import to_filter
 
 from fastapi import APIRouter, Depends, Path, Query
 from fastapi.templating import Jinja2Templates
@@ -243,7 +248,7 @@ class Endpoints:
 
         @self.router.get(
             "/collections",
-            response_model=model.Collections,
+            # response_model=model.Collections,
             response_model_exclude_none=True,
             responses={
                 200: {
@@ -259,8 +264,11 @@ class Endpoints:
             output_type: Optional[ResponseType] = Depends(OutputType),
         ):
             """List of collections."""
-            functions = getattr(request.app.state, "function_catalog", {})
-            tables = getattr(request.app.state, "table_catalog", [])
+            # functions = getattr(request.app.state, "function_catalog", {})
+            # tables = getattr(request.app.state, "table_catalog", [])
+            tables = getattr(request.app.state.table_catalog, "tables", [])
+            ignore = ['spatial_ref_sys', 'geography_columns', 'geometry_columns']
+            tables = [t for t in tables if t.table not in ignore]
 
             data = model.Collections(
                 links=[
@@ -278,7 +286,9 @@ class Endpoints:
                 collections=[
                     model.Collection(
                         **{
-                            **collection.dict(),
+                            "id": collection.id,
+                            "title": collection.id,
+                            "description": collection.description,
                             "links": [
                                 model.Link(
                                     href=self.url_for(
@@ -303,7 +313,7 @@ class Endpoints:
                     )
                     for collection in [
                         *tables,
-                        *list(functions.values()),
+                        # *list(functions.values()),
                     ]
                 ],
             )
@@ -397,13 +407,12 @@ class Endpoints:
             ),
             bbox: Optional[List[float]] = Depends(bbox_query),
             datetime: Optional[str] = Depends(datetime_query),
-            properties: Optional[str] = Query(
-                None,
-                description="Return only specific properties (comma-separated). If PROP-LIST is empty, no properties are returned. If not present, all properties are returned.",
-            ),
+            properties: Optional[List[str]] = Depends(properties_query),
             output_type: Optional[ResponseType] = Depends(OutputType),
+            filter: Optional[Callable] = Depends(filter_query),
         ):
             offset = offset or 0
+
 
             # <NAME>=VALUE - filter features for a property having a value. Multiple property filters are ANDed together.
             # qs_key_to_remove = [
@@ -422,6 +431,10 @@ class Endpoints:
 
             items = await collection.features(
                 request.app.state.pool,
+                bbox=bbox,
+                datetime=datetime,
+                filter=filter,
+                properties=properties,
                 limit=limit,
                 offset=offset,
             )

@@ -1,7 +1,7 @@
 """tifeatures dependencies."""
 
 import re
-from typing import List, Optional
+from typing import Callable, List, Literal, Optional
 
 from tifeatures.layer import CollectionLayer
 from tifeatures.resources.enums import AcceptType, ResponseType
@@ -10,6 +10,7 @@ from fastapi import HTTPException, Path, Query
 
 from starlette.requests import Request
 
+from pygeofilter.parsers import cql2_json, cql2_text
 
 def CollectionParams(
     request: Request,
@@ -36,7 +37,7 @@ def CollectionParams(
         assert table_pattern.groupdict()["table"]
 
         table_catalog = getattr(request.app.state, "table_catalog", [])
-        for r in table_catalog:
+        for r in table_catalog.tables:
             if r.id == collectionId:
                 return r
 
@@ -80,6 +81,14 @@ def datetime_query(
     # TODO validation / format
     return datetime
 
+def properties_query(
+    properties: Optional[str] = Query(
+        None,
+        description="Return only specific properties (comma-separated). If PROP-LIST is empty, no properties are returned. If not present, all properties are returned.",
+    )
+) -> Optional[List[str]]:
+    if properties is not None:
+        return [p.strip() for p in properties.split(',')]
 
 def OutputType(
     request: Request,
@@ -93,4 +102,22 @@ def OutputType(
     if accept_header in AcceptType.__members__.values():
         return ResponseType[AcceptType(accept_header).name]
 
+    return None
+
+def filter_query(
+    filter: Optional[str] = Query(
+        None,
+        description="CQL2 Filter"
+    ),
+    filterlang: Optional[Literal['cql2-text','cql2-json']] = Query(
+        'cql2-text',
+        description="CQL2 Language (cql2-text, cql2-json)",
+        alias="filter-lang"
+    )
+) -> Optional[Callable]:
+    if filter is not None:
+        if filterlang == 'cql2-json':
+            return cql2_json.parse(filter)
+        else:
+            return cql2_text.parse(filter)
     return None

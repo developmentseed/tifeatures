@@ -6,13 +6,14 @@ from tifeatures.errors import DEFAULT_STATUS_CODES, add_exception_handlers
 from tifeatures.factory import Endpoints
 from tifeatures.layer import FunctionRegistry
 from tifeatures.middleware import CacheControlMiddleware
-from tifeatures.settings import APISettings
+from tifeatures.settings import APISettings, PostgresSettings
 
 from fastapi import FastAPI
 
 from starlette.middleware.cors import CORSMiddleware
 from starlette_cramjam.middleware import CompressionMiddleware
 
+pgsettings = PostgresSettings()
 settings = APISettings()
 
 app = FastAPI(
@@ -27,7 +28,7 @@ endpoints = Endpoints()
 app.include_router(endpoints.router)
 
 # We add the function registry to the application state
-app.state.function_catalog = FunctionRegistry()
+# app.state.function_catalog = FunctionRegistry()
 
 # Set all CORS enabled origins
 if settings.cors_origins:
@@ -49,6 +50,7 @@ async def startup_event() -> None:
     """Connect to database on startup."""
     await connect_to_db(app)
     await register_table_catalog(app)
+
 
 
 @app.on_event("shutdown")
