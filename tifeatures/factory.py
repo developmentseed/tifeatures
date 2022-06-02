@@ -26,6 +26,12 @@ from starlette.templating import Jinja2Templates
 
 import jinja2
 
+try:
+    from jinja2 import pass_context
+except ImportError:
+    # jinja2 < 3.0 fallback
+    from jinja2 import contextfilter as pass_context
+
 settings = APISettings()
 
 class SearchPathTemplates(Jinja2Templates):
@@ -43,7 +49,7 @@ class SearchPathTemplates(Jinja2Templates):
     def _create_env(
         self, directory: Union[str, PathLike, List[Union[str, None, PathLike]]], **env_options: Any
     ) -> "jinja2.Environment":
-        @jinja2.pass_context
+        @pass_context
         def url_for(context: dict, name: str, **path_params: Any) -> str:
             request = context["request"]
             return request.url_for(name, **path_params)
