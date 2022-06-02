@@ -61,7 +61,7 @@ def bbox_query(
             raise Exception("Invalid BBOX.")
 
         bounds = tuple(map(float, split_bbox))
-        return Polygon.from_bounds(*bounds)
+        return Polygon.from_bounds(*bounds)  # type: ignore
 
     return None
 

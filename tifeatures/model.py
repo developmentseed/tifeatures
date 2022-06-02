@@ -2,7 +2,7 @@
 
 from typing import List, Optional
 
-from geojson_pydantic import Feature, FeatureCollection
+from geojson_pydantic.features import Feature, FeatureCollection
 from pydantic import BaseModel
 
 from tifeatures.resources.enums import MediaType

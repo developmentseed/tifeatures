@@ -8,7 +8,7 @@ from buildpg import Var as pg_variable
 from buildpg import asyncpg, clauses
 from buildpg import funcs as pg_funcs
 from buildpg import render
-from geojson_pydantic import Feature, FeatureCollection
+from geojson_pydantic.features import Feature, FeatureCollection
 from pydantic import BaseModel, Field, root_validator
 
 
@@ -41,7 +41,7 @@ class CollectionLayer(BaseModel, metaclass=abc.ABCMeta):
         limit: int = None,
         offset: int = None,
         **kwargs: Any,
-    ) -> Items:
+    ) -> FeatureCollection:
         """Return a FeatureCollection."""
         ...
 
@@ -85,7 +85,7 @@ class Table(CollectionLayer):
         limit: int = None,
         offset: int = None,
         **kwargs: Any,
-    ) -> Items:
+    ) -> FeatureCollection:
         """Return a FeatureCollection."""
 
         limit = limit or 10

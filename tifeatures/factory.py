@@ -2,11 +2,11 @@
 
 import json
 import pathlib
-from os import PathLike
-from typing import Union, List, Any
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from os import PathLike
+from typing import Any, Callable, List, Optional, Union
 
+import jinja2
 from geojson_pydantic.geometries import Polygon
 
 from tifeatures import model
@@ -21,18 +21,15 @@ from fastapi import APIRouter, Depends, Path, Query
 
 from starlette.datastructures import QueryParams
 from starlette.requests import Request
-from starlette.responses import HTMLResponse
-from starlette.templating import Jinja2Templates
+from starlette.templating import Jinja2Templates, _TemplateResponse
 
-import jinja2
-
-try:
-    from jinja2 import pass_context
-except ImportError:
-    # jinja2 < 3.0 fallback
-    from jinja2 import contextfilter as pass_context
+if hasattr(jinja2, "pass_context"):
+    pass_context = jinja2.pass_context  # type: ignore
+else:  # pragma: nocover
+    pass_context = jinja2.contextfunction  # type: ignore[attr-defined]
 
 settings = APISettings()
+
 
 class SearchPathTemplates(Jinja2Templates):
     """
@@ -41,13 +38,18 @@ class SearchPathTemplates(Jinja2Templates):
     """
 
     def __init__(
-        self, directory: Union[str, PathLike, List[Union[str, None, PathLike]]], **env_options: Any
+        self,
+        directory: Union[str, PathLike, List[Union[str, None, PathLike]]],
+        **env_options: Any,
     ) -> None:
+        """Initialize Search Path Template."""
         assert jinja2 is not None, "jinja2 must be installed to use Jinja2Templates"
         self.env = self._create_env(directory, **env_options)
 
     def _create_env(
-        self, directory: Union[str, PathLike, List[Union[str, None, PathLike]]], **env_options: Any
+        self,
+        directory: Union[str, PathLike, List[Union[str, None, PathLike]]],
+        **env_options: Any,
     ) -> "jinja2.Environment":
         @pass_context
         def url_for(context: dict, name: str, **path_params: Any) -> str:
@@ -67,11 +69,14 @@ class SearchPathTemplates(Jinja2Templates):
 
 
 default_template_dir = str(pathlib.Path(__file__).parent.joinpath("templates"))
-templates = SearchPathTemplates(directory=[settings.template_directory, default_template_dir])
+templates = SearchPathTemplates(
+    directory=[settings.template_directory, default_template_dir]
+)
+
 
 def create_html_response(
     request: Request, data: str, template_name: str
-) -> HTMLResponse:
+) -> _TemplateResponse:
     """Create Template response."""
     urlpath = request.url.path
     crumbs = []
@@ -522,9 +527,8 @@ class Endpoints:
 
             if (matched_items - items_returned) > offset:
                 next_offset = offset + items_returned
-                query_params = QueryParams(
-                    {**request.query_params, "offset": next_offset}
-                )
+                query_params = {**request.query_params, "offset": next_offset}
+
                 url = (
                     self.url_for(request, "items", collectionId=collection.id)
                     + f"?{query_params}"
@@ -538,13 +542,13 @@ class Endpoints:
                 query_params.pop("offset")
                 prev_offset = max(offset - items_returned, 0)
                 if prev_offset:
-                    query_params = QueryParams({**query_params, "offset": prev_offset})
+                    query_params = {**query_params, "offset": prev_offset}
                 else:
-                    query_params = QueryParams({**query_params})
+                    query_params = {**query_params}
 
                 url = self.url_for(request, "items", collectionId=collection.id)
                 if query_params:
-                    url += f"?{query_params}"
+                    url += f"?{QueryParams(**query_params)}"
 
                 links.append(
                     model.Link(href=url, rel="prev", type=MediaType.geojson),
