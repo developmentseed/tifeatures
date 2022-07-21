@@ -262,32 +262,53 @@ class Table(CollectionLayer, DBTable):
                     logic.V(dt_name) < logic.S(pg_funcs.cast(end, "timestamptz")),
                 )
 
-    def _sortby(self, sortby: Optional[str]):
+    def _sorting(self, sortby: Optional[str]):
+        pk = self.id_column
+        sortcols=[]
         sorts = []
-        if sortby:
-            for s in sortby.strip().split(","):
-                parts = re.match(
-                    "^(?P<direction>[+-]?)(?P<column>.*)$", s
-                ).groupdict()  # type:ignore
+        reversesorts = []
+        prevwheres = []
+        nextwheres = []
+        sortby = sortby.strip()
+        if sortby is None:
+            sortby = pk
+        if pk not in sortby:
+            sortby += ',' + pk
+        sortbyarr = sortby.split(",")
+        pkseen = False
 
-                direction = parts["direction"]
-                column = parts["column"].strip()
-                if self.get_column(column):
-                    if direction == "-":
-                        sorts.append(logic.V(column).desc())
-                    else:
-                        sorts.append(logic.V(column))
+        q,p = render(
+        for s in sortbyarr:
+            parts = re.match(
+                "^(?P<direction>[+-]?)(?P<column>.*)$", s
+            ).groupdict()  # type:ignore
+
+            direction = parts["direction"]
+            column = parts["column"].strip()
+            if column == pk:
+                pkseen = True
+            if self.get_column(column):
+                sortcols.append(column)
+                if direction == "-":
+                    sorts.append(logic.V(column).desc())
+                    reversesorts.append(logic.V(column).desc())
+
                 else:
-                    raise InvalidPropertyName(f"Property {column} does not exist.")
+                    sorts.append(logic.V(column))
+                    reversesorts.append(logic.V(column).desc())
+            else:
+                raise InvalidPropertyName(f"Property {column} does not exist.")
 
-        else:
-            sorts.append(logic.V(self.id_column))
+        if not pkseen:
+            sorts.append(logic.V(pk))
+            reversesorts.append(logic.V(pk).desc())
 
         return clauses.OrderBy(*sorts)
 
+
+
     def _features_query(
         self,
-        *,
         ids_filter: Optional[List[str]] = None,
         bbox_filter: Optional[List[float]] = None,
         datetime_filter: Optional[List[str]] = None,
@@ -326,8 +347,8 @@ class Table(CollectionLayer, DBTable):
         datetime_filter: Optional[List[str]] = None,
         properties_filter: Optional[List[Tuple[str, str]]] = None,
         cql_filter: Optional[AstType] = None,
-        geom: str = None,
-        dt: str = None,
+        geom: Optional[str] = None,
+        dt: Optional[str] = None,
     ):
         """Build features COUNT query."""
         return (
@@ -344,96 +365,72 @@ class Table(CollectionLayer, DBTable):
             )
         )
 
+    async def query_count(self, pool, **kwargs):
+        """Get the estimated count/cost from query."""
+        if 'count_exact' in kwargs:
+            async with pool.acquire() as conn:
+                q,p = render(
+                    """
+                    SELECT count(*)
+                    :f
+                    """,
+                    f=self._from(),
+                    w = self._where(**kwargs)
+                )
+                return conn.fetchval(q,*p)
+        q,p = render(
+            """
+            EXPLAIN (FORMAT JSON)
+            SELECT 1
+            :f
+            :o
+            """,
+            f=self._from(),
+            w = self._where(**kwargs)
+        )
+        async with pool.acquire() as conn:
+            explain = await conn.fetchval(q, *p)
+            return explain[0]['Plan']['Plan Rows']
+
     async def query(
         self,
         pool: asyncpg.BuildPgPool,
-        *,
-        ids_filter: Optional[List[str]] = None,
-        bbox_filter: Optional[List[float]] = None,
-        datetime_filter: Optional[List[str]] = None,
-        properties_filter: Optional[List[Tuple[str, str]]] = None,
-        cql_filter: Optional[AstType] = None,
-        sortby: Optional[str] = None,
-        properties: Optional[List[str]] = None,
-        geom: str = None,
-        dt: str = None,
-        limit: Optional[int] = None,
-        offset: Optional[int] = None,
-        bbox_only: Optional[bool] = None,
-        simplify: Optional[float] = None,
+        **kwargs
     ) -> Tuple[FeatureCollection, int]:
         """Build and run Pg query."""
+        geom = kwargs['geom']
         if geom and geom.lower() != "none" and not self.geometry_column(geom):
             raise InvalidGeometryColumnName(f"Invalid Geometry Column: {geom}.")
 
-        sql_query = """
-            WITH
-                features AS (
-                    :features_q
-                ),
-                total_count AS (
-                    :count_q
+        q,p = render(
+            """
+            WITH features AS (
+                :features
+            )
+            SELECT
+                json_build_object(
+                    'type', 'Feature',
+                    'id', :id_column,
+                    'geometry', :geometry_q,
+                    'properties', to_jsonb( features.* ) - :geom_columns::text[]
                 )
-            SELECT json_build_object(
-                'type', 'FeatureCollection',
-                'features',
-                    (
-                        SELECT
-                            json_agg(
-                                json_build_object(
-                                    'type', 'Feature',
-                                    'id', :id_column,
-                                    'geometry', :geometry_q,
-                                    'properties', to_jsonb( features.* ) - :geom_columns::text[]
-                                )
-                            )
-                        FROM features
-                    ),
-                'total_count',
-                    (
-                        SELECT count FROM total_count
-                    )
-                )
+            FROM features
             ;
-        """
-        q, p = render(
-            sql_query,
-            features_q=self._features_query(
-                ids_filter=ids_filter,
-                bbox_filter=bbox_filter,
-                datetime_filter=datetime_filter,
-                properties_filter=properties_filter,
-                cql_filter=cql_filter,
-                sortby=sortby,
-                properties=properties,
-                geom=geom,
-                dt=dt,
-                limit=limit,
-                offset=offset,
-            ),
-            count_q=self._features_count_query(
-                ids_filter=ids_filter,
-                bbox_filter=bbox_filter,
-                datetime_filter=datetime_filter,
-                properties_filter=properties_filter,
-                cql_filter=cql_filter,
-                geom=geom,
-                dt=dt,
-            ),
+            """,
             id_column=logic.V(self.id_column),
-            geometry_q=self._geom(
-                geometry_column=self.geometry_column(geom),
-                bbox_only=bbox_only,
-                simplify=simplify,
-            ),
+            geometry_q=self._geom(**kwargs),
             geom_columns=[g.name for g in self.geometry_columns],
+            features=self._features(**kwargs),
         )
         async with pool.acquire() as conn:
             items = await conn.fetchval(q, *p)
+            features = (item for item in items)
+
+        count = await self.query_count(**kwargs)
 
         return (
-            FeatureCollection(features=items.get("features") or []),
-            items["total_count"],
+            FeatureCollection(features=features or []),
+            count,
         )
 
     async def features(

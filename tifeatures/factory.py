@@ -603,6 +603,41 @@ class Endpoints:
                 for (key, value) in request.query_params.items()
                 if key.lower() not in exclude
             ]
+            _select = collection.select(properties)
+            _from = collection._from()
+            _geom = collection._geom(geom_column, bbox_only, simplify)
+            _where = collection._where(
+                ids=ids_filter,
+                datetime=datetime_filter,
+                bbox=bbox_filter,
+                properties=properties_filter,
+                cql=cql_filter,
+                geom=geom_column,
+                dt=datetime_column
+            )
+            _sortby = collection._sortby(sort=sortby)
+
+            if next or prev:
+                # Get columns used in sort from table using pk to create offset
+                """
+                SELECT sortcols FROM table WHERE pk = pk
+                """
+            # get first record
+            """SELECT pk FROM table WHERE <where> <sortby> LIMIT 1;"""
+            # get last - limit record if limit set
+            """SELECT pk FROM table WHERE <where> <reversesortby> OFFSET <offset> LIMIT 1;"""
+            # get previous record
+            if next is None and offset is None:
+                # no paging parameters, so this is first record
+                prev = None
+            elif next is not None:
+                """
+                SELECT sortcols FROM table WHERE pk = pk
+            """
+            SELECT pk FROM table WHERE <where> AND <sortby>
+            """
+            # get next record
+            """SELECT pk FROM table WHERE <where> <sortby> OFFSET <offset> LIMIT 1;"""
 
             items, matched_items = await collection.features(
                 request.app.state.pool,
