@@ -1,12 +1,12 @@
 """tifeatures.layers."""
 
 import abc
+import json
 import re
 from dataclasses import dataclass
 from time import time
 from typing import Any, ClassVar, Dict, List, Optional, Tuple
 
-import orjson
 from buildpg import asyncpg, clauses
 from buildpg import funcs as pg_funcs
 from buildpg import logic, render
@@ -26,6 +26,8 @@ from tifeatures.errors import (
 )
 from tifeatures.filter.evaluate import to_filter
 from tifeatures.filter.filters import bbox_to_wkt
+
+from starlette.datastructures import QueryParams
 
 # Links to geojson schema
 geojson_schema = {
@@ -416,7 +418,9 @@ class Table(CollectionLayer, DBTable):
                 async for record in conn.cursor(q, *p, prefetch=50, timeout=120):
                     yield record[0] + "\n"
 
-    async def query_geojson(self, pool, features_query, collection_href, total):
+    async def query_geojson(
+        self, pool, features_query, collection_href, total, query_params=None
+    ):
         """Build and run Pg query to get json rows."""
         cnt = 0
         yield '{"type":"FeatureCollection","features":['
@@ -426,17 +430,55 @@ class Table(CollectionLayer, DBTable):
                 yield "," + rec
             else:
                 yield rec
-        links = orjson.dumps(
-            [
+        links = [
+            {
+                "title": "Collection",
+                "href": collection_href,
+                "rel": "collection",
+                "type": "application/json",
+            },
+            {
+                "title": "Items",
+                "href": f"{collection_href}/items?{str(query_params)}",
+                "rel": "self",
+                "type": "application/json",
+            },
+        ]
+
+        if query_params:
+            offset = int(query_params.get("offset", 0))
+        else:
+            offset = 0
+
+        if (total - cnt) > offset:
+            next_offset = offset + cnt
+            query_params = QueryParams({**query_params, "offset": next_offset})
+
+            links.append(
                 {
-                    "title": "Collection",
-                    "href": collection_href,
-                    "rel": "collection",
+                    "title": "Items",
+                    "href": f"{collection_href}/items?{str(query_params)}",
+                    "rel": "next",
                     "type": "application/json",
                 }
-            ]
-        ).decode()
-        yield f'],"numberMatched":{total},"numberReturned":{cnt}, "links":{links}}}'
+            )
+
+        if offset > 0:
+            prev_offset = max(offset - cnt, 0)
+            query_params = QueryParams({**query_params, "offset": prev_offset})
+
+            links.append(
+                {
+                    "title": "Items",
+                    "href": f"{collection_href}/items?{str(query_params)}",
+                    "rel": "prev",
+                    "type": "application/json",
+                }
+            )
+
+        links_str = json.dumps(links)
+
+        yield f'],"numberMatched":{total},"numberReturned":{cnt}, "links":{links_str}}}'
 
     async def features(
         self,

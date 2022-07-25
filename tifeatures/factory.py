@@ -641,6 +641,8 @@ class Endpoints:
                 )
             )
 
+            qs = "?" + str(request.query_params) if request.query_params else ""
+
             if output_type == MediaType.geojsonseq:
                 return StreamingResponse(
                     collection.query_geojson_rows(pool, _features, collection_href),
@@ -653,7 +655,11 @@ class Endpoints:
             if output_type == MediaType.geojson:
                 return StreamingResponse(
                     collection.query_geojson(
-                        pool, _features, collection_href, total_count
+                        pool,
+                        _features,
+                        collection_href,
+                        total_count,
+                        query_params=request.query_params,
                     ),
                     media_type=MediaType.geojson,
                 )
