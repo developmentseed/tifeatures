@@ -633,9 +633,17 @@ class Endpoints:
             print(total_count)
             print(output_type)
 
+            collection_href = str(
+                self.url_for(
+                    request,
+                    "collection",
+                    collectionId=collection.id,
+                )
+            )
+
             if output_type == MediaType.geojsonseq:
                 return StreamingResponse(
-                    collection.query_geojson_rows(pool, _features),
+                    collection.query_geojson_rows(pool, _features, collection_href),
                     media_type=MediaType.geojsonseq,
                     headers={
                         "Content-Disposition": "attachment;filename=items.geojsonseq"
@@ -644,7 +652,9 @@ class Endpoints:
 
             if output_type == MediaType.geojson:
                 return StreamingResponse(
-                    collection.query_geojson(pool, _features, total_count),
+                    collection.query_geojson(
+                        pool, _features, collection_href, total_count
+                    ),
                     media_type=MediaType.geojson,
                 )
 

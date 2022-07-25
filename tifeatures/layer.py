@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from time import time
 from typing import Any, ClassVar, Dict, List, Optional, Tuple
 
+import orjson
 from buildpg import asyncpg, clauses
 from buildpg import funcs as pg_funcs
 from buildpg import logic, render
@@ -374,7 +375,7 @@ class Table(CollectionLayer, DBTable):
             explain = await conn.fetchval(q, *p)
             return explain[0]["Plan"]["Plan Rows"]
 
-    async def query_geojson_rows(self, pool, features_query):
+    async def query_geojson_rows(self, pool, features_query, collection_href):
         """Build and run Pg query to get json rows."""
         st = time()
         q, p = render(
@@ -383,30 +384,59 @@ class Table(CollectionLayer, DBTable):
                 :features_query
             )
             SELECT
-                json_build_object(
+                jsonb_build_object(
                     'type', 'Feature',
                     'id', itemid,
                     'geometry', ST_ASGeoJson(geom)::json,
-                    'properties', to_jsonb( features.* ) - '{pk,geom}'::text[]
+                    'properties', to_jsonb( features.* ) - '{itemid,geom}'::text[],
+                    'links', jsonb_build_array(
+                        jsonb_build_object(
+                            'title', 'Collection',
+                            'href', :collection_href::text,
+                            'rel', 'collection',
+                            'type', 'application/json'
+                        ),
+                        jsonb_build_object(
+                            'title', 'Item',
+                            'href', format('%s/items/%s',:collection_href::text,itemid),
+                            'rel', 'item',
+                            'type', 'application/json'
+                        )
+                    )
                 )::text
             FROM features
             ;
             """,
             features_query=features_query,
+            collection_href=collection_href,
         )
+        print(q, p)
         async with pool.acquire() as conn:
             async with conn.transaction():
                 async for record in conn.cursor(q, *p, prefetch=50, timeout=120):
                     yield record[0] + "\n"
 
-    async def query_geojson(self, pool, features_query, total):
+    async def query_geojson(self, pool, features_query, collection_href, total):
         """Build and run Pg query to get json rows."""
         cnt = 0
         yield '{"type":"FeatureCollection","features":['
-        async for rec in self.query_geojson_rows(pool, features_query):
+        async for rec in self.query_geojson_rows(pool, features_query, collection_href):
             cnt += 1
-            yield rec
-        yield f'],"numberMatched":{total},"numberReturned":{cnt}}}'
+            if cnt > 1:
+                yield "," + rec
+            else:
+                yield rec
+        links = orjson.dumps(
+            [
+                {
+                    "title": "Collection",
+                    "href": collection_href,
+                    "rel": "collection",
+                    "type": "application/json",
+                }
+            ]
+        ).decode()
+        yield f'],"numberMatched":{total},"numberReturned":{cnt}, "links":{links}}}'
 
     async def features(
         self,
