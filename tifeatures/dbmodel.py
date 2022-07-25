@@ -90,16 +90,22 @@ class Table(BaseModel):
             if col.name == self.id_column:
                 return col
 
-    def columns(self, properties: Optional[List[str]] = None) -> List[str]:
+    def columns(
+        self, properties: Optional[List[str]] = None, nogeo: bool = False
+    ) -> List[str]:
         """Return table columns optionally filtered to only include columns from properties."""
-        cols = [c.name for c in self.properties]
+        if nogeo:
+            cols = [c.name for c in self.properties if not c.type.startswith("geo")]
+        else:
+            cols = [c.name for c in self.properties]
         if properties is not None:
             if self.id_column not in properties:
                 properties.append(self.id_column)
 
-            geom_col = self.geometry_column()
-            if geom_col:
-                properties.append(geom_col.name)
+            if not nogeo:
+                geom_col = self.geometry_column()
+                if geom_col:
+                    properties.append(geom_col.name)
 
             cols = [col for col in cols if col in properties]
 

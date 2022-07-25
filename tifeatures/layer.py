@@ -3,6 +3,7 @@
 import abc
 import re
 from dataclasses import dataclass
+from time import time
 from typing import Any, ClassVar, Dict, List, Optional, Tuple
 
 from buildpg import asyncpg, clauses
@@ -114,7 +115,7 @@ class Table(CollectionLayer, DBTable):
         return values
 
     def _select(self, properties: Optional[List[str]]):
-        return clauses.Select(self.columns(properties))
+        return clauses.Select(self.columns(properties, True))
 
     def _select_count(self):
         return clauses.Select(pg_funcs.count("*"))
@@ -124,12 +125,17 @@ class Table(CollectionLayer, DBTable):
 
     def _geom(
         self,
-        geometry_column: Optional[GeometryColumn],
+        geom_column: Optional[str],
         bbox_only: Optional[bool],
         simplify: Optional[float],
     ):
-        if geometry_column is None:
-            return pg_funcs.cast(None, "json")
+        if geom_column and geom_column.lower() == "none":
+            return None
+
+        geometry_column = self.geometry_column(geom_column)
+
+        if not geometry_column:
+            raise InvalidGeometryColumnName(f"Invalid Geometry Column: {geom_column}.")
 
         g = logic.V(geometry_column.name)
         g = pg_funcs.cast(g, "geometry")
@@ -146,7 +152,7 @@ class Table(CollectionLayer, DBTable):
                 simplify,
             )
 
-        g = logic.Func("ST_AsGeoJson", g)
+        g = g.as_("geom")
 
         return g
 
@@ -157,8 +163,8 @@ class Table(CollectionLayer, DBTable):
         bbox: Optional[List[float]] = None,
         properties: Optional[List[Tuple[str, Any]]] = None,
         cql: Optional[AstType] = None,
-        geom: str = None,
-        dt: str = None,
+        geom: Optional[str] = None,
+        dt: Optional[str] = None,
     ):
         """Construct WHERE query."""
         wheres = [logic.S(True)]
@@ -262,50 +268,34 @@ class Table(CollectionLayer, DBTable):
                     logic.V(dt_name) < logic.S(pg_funcs.cast(end, "timestamptz")),
                 )
 
-    def _sorting(self, sortby: Optional[str]):
+    def _sortby(self, sortby: Optional[str], limit: int, offset: int):
         pk = self.id_column
-        sortcols=[]
         sorts = []
-        reversesorts = []
-        prevwheres = []
-        nextwheres = []
-        sortby = sortby.strip()
-        if sortby is None:
-            sortby = pk
-        if pk not in sortby:
-            sortby += ',' + pk
-        sortbyarr = sortby.split(",")
         pkseen = False
 
-        q,p = render(
-        for s in sortbyarr:
-            parts = re.match(
-                "^(?P<direction>[+-]?)(?P<column>.*)$", s
-            ).groupdict()  # type:ignore
+        if sortby:
+            for s in sortby.strip().split(","):
+                parts = re.match(
+                    "^(?P<direction>[+-]?)(?P<column>.*)$", s
+                ).groupdict()  # type:ignore
 
-            direction = parts["direction"]
-            column = parts["column"].strip()
-            if column == pk:
-                pkseen = True
-            if self.get_column(column):
-                sortcols.append(column)
-                if direction == "-":
-                    sorts.append(logic.V(column).desc())
-                    reversesorts.append(logic.V(column).desc())
+                direction = parts["direction"]
+                column = parts["column"].strip()
+                if column == pk:
+                    pkseen = True
+                if self.get_column(column):
+                    if direction == "-":
+                        sorts.append(logic.V(column).desc())
 
+                    else:
+                        sorts.append(logic.V(column))
                 else:
-                    sorts.append(logic.V(column))
-                    reversesorts.append(logic.V(column).desc())
-            else:
-                raise InvalidPropertyName(f"Property {column} does not exist.")
+                    raise InvalidPropertyName(f"Property {column} does not exist.")
 
         if not pkseen:
             sorts.append(logic.V(pk))
-            reversesorts.append(logic.V(pk).desc())
 
-        return clauses.OrderBy(*sorts)
-
-
+        return clauses.OrderBy(*sorts) + clauses.Limit(limit) + clauses.Offset(offset)
 
     def _features_query(
         self,
@@ -316,8 +306,8 @@ class Table(CollectionLayer, DBTable):
         cql_filter: Optional[AstType] = None,
         sortby: Optional[str] = None,
         properties: Optional[List[str]] = None,
-        geom: str = None,
-        dt: str = None,
+        geom: Optional[str] = None,
+        dt: Optional[str] = None,
         limit: Optional[int] = None,
         offset: Optional[int] = None,
     ):
@@ -365,73 +355,58 @@ class Table(CollectionLayer, DBTable):
             )
         )
 
-    async def query_count(self, pool, **kwargs):
+    async def query_count(self, pool, _from_clause, _where_clause, count_exact):
         """Get the estimated count/cost from query."""
-        if 'count_exact' in kwargs:
+        from_where_clause = _from_clause + _where_clause
+        if count_exact:
             async with pool.acquire() as conn:
-                q,p = render(
-                    """
-                    SELECT count(*)
-                    :f
-                    """,
-                    f=self._from(),
-                    w = self._where(**kwargs)
-                )
-                return conn.fetchval(q,*p)
-        q,p = render(
+                q, p = (self._select_count() + from_where_clause).render()
+                return conn.fetchval(q, *p)
+        q, p = render(
             """
             EXPLAIN (FORMAT JSON)
             SELECT 1
-            :f
-            :o
+            :from_where_clause
             """,
-            f=self._from(),
-            w = self._where(**kwargs)
+            from_where_clause=from_where_clause,
         )
         async with pool.acquire() as conn:
             explain = await conn.fetchval(q, *p)
-            return explain[0]['Plan']['Plan Rows']
+            return explain[0]["Plan"]["Plan Rows"]
 
-    async def query(
-        self,
-        pool: asyncpg.BuildPgPool,
-        **kwargs
-    ) -> Tuple[FeatureCollection, int]:
-        """Build and run Pg query."""
-        geom = kwargs['geom']
-        if geom and geom.lower() != "none" and not self.geometry_column(geom):
-            raise InvalidGeometryColumnName(f"Invalid Geometry Column: {geom}.")
-
-        q,p = render(
+    async def query_geojson_rows(self, pool, features_query):
+        """Build and run Pg query to get json rows."""
+        st = time()
+        q, p = render(
             """
             WITH features AS (
-                :features
+                :features_query
             )
             SELECT
                 json_build_object(
                     'type', 'Feature',
-                    'id', :id_column,
-                    'geometry', :geometry_q,
-                    'properties', to_jsonb( features.* ) - :geom_columns::text[]
-                )
+                    'id', itemid,
+                    'geometry', ST_ASGeoJson(geom)::json,
+                    'properties', to_jsonb( features.* ) - '{pk,geom}'::text[]
+                )::text
             FROM features
             ;
             """,
-            id_column=logic.V(self.id_column),
-            geometry_q=self._geom(**kwargs),
-            geom_columns=[g.name for g in self.geometry_columns],
-            features=self._features(**kwargs),
+            features_query=features_query,
         )
         async with pool.acquire() as conn:
-            items = await conn.fetchval(q, *p)
-            features = (item for item in items)
+            async with conn.transaction():
+                async for record in conn.cursor(q, *p, prefetch=50, timeout=120):
+                    yield record[0] + "\n"
 
-        count = await self.query_count(**kwargs)
-
-        return (
-            FeatureCollection(features=features or []),
-            count,
-        )
+    async def query_geojson(self, pool, features_query, total):
+        """Build and run Pg query to get json rows."""
+        cnt = 0
+        yield '{"type":"FeatureCollection","features":['
+        async for rec in self.query_geojson_rows(pool, features_query):
+            cnt += 1
+            yield rec
+        yield f'],"numberMatched":{total},"numberReturned":{cnt}}}'
 
     async def features(
         self,
