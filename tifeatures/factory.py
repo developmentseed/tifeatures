@@ -25,18 +25,19 @@ from tifeatures.dependencies import (
 from tifeatures.errors import NotFound
 from tifeatures.layer import CollectionLayer
 from tifeatures.layer import Table as TableLayer
-from tifeatures.resources.enums import MediaType
+from tifeatures.resources.enums import MediaType, OptionalHeader
 from tifeatures.resources.response import (
     GeoJSONResponse,
     JSONResponse,
     SchemaJSONResponse,
 )
+from tifeatures.utils import Timer
 
 from fastapi import APIRouter, Depends, Path, Query
 
 from starlette.datastructures import QueryParams
 from starlette.requests import Request
-from starlette.responses import StreamingResponse
+from starlette.responses import Response, StreamingResponse
 from starlette.templating import Jinja2Templates, _TemplateResponse
 
 DEFAULT_TEMPLATES = Jinja2Templates(
@@ -88,6 +89,9 @@ class Endpoints:
     title: str = "TiFeatures"
 
     templates: Jinja2Templates = DEFAULT_TEMPLATES
+
+    # add additional headers in response
+    optional_headers: List[OptionalHeader] = field(default_factory=list)
 
     def __post_init__(self):
         """Post Init: register route and configure specific options."""
@@ -542,6 +546,7 @@ class Endpoints:
         )
         async def items(
             request: Request,
+            response: Response,
             collection=Depends(self.collection_dependency),
             ids_filter: Optional[List[str]] = Depends(ids_query),
             bbox_filter: Optional[List[float]] = Depends(bbox_query),
@@ -604,22 +609,25 @@ class Endpoints:
                 if key.lower() not in exclude
             ]
 
-            items, matched_items = await collection.features(
-                request.app.state.pool,
-                ids_filter=ids_filter,
-                bbox_filter=bbox_filter,
-                datetime_filter=datetime_filter,
-                properties_filter=properties_filter,
-                cql_filter=cql_filter,
-                sortby=sortby,
-                properties=properties,
-                limit=limit,
-                offset=offset,
-                geom=geom_column,
-                dt=datetime_column,
-                bbox_only=bbox_only,
-                simplify=simplify,
-            )
+            timings = []
+            with Timer() as t:
+                items, matched_items = await collection.features(
+                    request.app.state.pool,
+                    ids_filter=ids_filter,
+                    bbox_filter=bbox_filter,
+                    datetime_filter=datetime_filter,
+                    properties_filter=properties_filter,
+                    cql_filter=cql_filter,
+                    sortby=sortby,
+                    properties=properties,
+                    limit=limit,
+                    offset=offset,
+                    geom=geom_column,
+                    dt=datetime_column,
+                    bbox_only=bbox_only,
+                    simplify=simplify,
+                )
+            timings.append(("dbread", round(t.elapsed * 1000, 2)))
 
             if output_type in (
                 MediaType.csv,
@@ -732,45 +740,56 @@ class Endpoints:
                     ),
                 )
 
-            data = model.Items(
-                id=collection.id,
-                title=collection.title or collection.id,
-                description=collection.description or collection.title or collection.id,
-                numberMatched=matched_items,
-                numberReturned=items_returned,
-                links=links,
-                features=[
-                    model.Item(
-                        **{
-                            **feature.dict(),
-                            "links": [
-                                model.Link(
-                                    title="Collection",
-                                    href=self.url_for(
-                                        request,
-                                        "collection",
-                                        collectionId=collection.id,
+            with Timer() as t:
+                data = model.Items(
+                    id=collection.id,
+                    title=collection.title or collection.id,
+                    description=collection.description
+                    or collection.title
+                    or collection.id,
+                    numberMatched=matched_items,
+                    numberReturned=items_returned,
+                    links=links,
+                    features=[
+                        model.Item(
+                            **{
+                                **feature.dict(),
+                                "links": [
+                                    model.Link(
+                                        title="Collection",
+                                        href=self.url_for(
+                                            request,
+                                            "collection",
+                                            collectionId=collection.id,
+                                        ),
+                                        rel="collection",
+                                        type=MediaType.json,
                                     ),
-                                    rel="collection",
-                                    type=MediaType.json,
-                                ),
-                                model.Link(
-                                    title="Item",
-                                    href=self.url_for(
-                                        request,
-                                        "item",
-                                        collectionId=collection.id,
-                                        itemId=feature.properties[collection.id_column],
+                                    model.Link(
+                                        title="Item",
+                                        href=self.url_for(
+                                            request,
+                                            "item",
+                                            collectionId=collection.id,
+                                            itemId=feature.properties[
+                                                collection.id_column
+                                            ],
+                                        ),
+                                        rel="item",
+                                        type=MediaType.json,
                                     ),
-                                    rel="item",
-                                    type=MediaType.json,
-                                ),
-                            ],
-                        }
-                    )
-                    for feature in items
-                ],
-            )
+                                ],
+                            }
+                        )
+                        for feature in items
+                    ],
+                )
+            timings.append(("format", round(t.elapsed * 1000, 2)))
+
+            if OptionalHeader.server_timing in self.optional_headers:
+                response.headers["Server-Timing"] = ", ".join(
+                    [f"{name};dur={time}" for (name, time) in timings]
+                )
 
             # HTML Response
             if output_type == MediaType.html:
@@ -810,42 +829,53 @@ class Endpoints:
         )
         async def item(
             request: Request,
+            response: Response,
             collection=Depends(self.collection_dependency),
             itemId: str = Path(..., description="Item identifier"),
             output_type: Optional[MediaType] = Depends(ItemOutputType),
         ):
-            feature = await collection.feature(
-                request.app.state.pool,
-                item_id=itemId,
-            )
+            timings = []
+            with Timer() as t:
+                feature = await collection.feature(
+                    request.app.state.pool,
+                    item_id=itemId,
+                )
+            timings.append(("dbread", round(t.elapsed * 1000, 2)))
 
             if not feature:
                 raise NotFound(
                     f"Item {itemId} in Collection {collection.id} does not exist."
                 )
 
-            data = model.Item(
-                **feature.dict(),
-                links=[
-                    model.Link(
-                        href=self.url_for(
-                            request, "collection", collectionId=collection.id
+            with Timer() as t:
+                data = model.Item(
+                    **feature.dict(),
+                    links=[
+                        model.Link(
+                            href=self.url_for(
+                                request, "collection", collectionId=collection.id
+                            ),
+                            rel="collection",
+                            type=MediaType.json,
                         ),
-                        rel="collection",
-                        type=MediaType.json,
-                    ),
-                    model.Link(
-                        href=self.url_for(
-                            request,
-                            "item",
-                            collectionId=collection.id,
-                            itemId=itemId,
+                        model.Link(
+                            href=self.url_for(
+                                request,
+                                "item",
+                                collectionId=collection.id,
+                                itemId=itemId,
+                            ),
+                            rel="self",
+                            type=MediaType.geojson,
                         ),
-                        rel="self",
-                        type=MediaType.geojson,
-                    ),
-                ],
-            )
+                    ],
+                )
+            timings.append(("format", round(t.elapsed * 1000, 2)))
+
+            if OptionalHeader.server_timing in self.optional_headers:
+                response.headers["Server-Timing"] = ", ".join(
+                    [f"{name};dur={time}" for (name, time) in timings]
+                )
 
             # HTML Response
             if output_type == MediaType.html:

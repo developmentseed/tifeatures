@@ -1,5 +1,6 @@
 """tifeatures app."""
 
+import logging
 from typing import Any, List
 
 import jinja2
@@ -9,7 +10,9 @@ from tifeatures.db import close_db_connection, connect_to_db, register_table_cat
 from tifeatures.errors import DEFAULT_STATUS_CODES, add_exception_handlers
 from tifeatures.factory import Endpoints
 from tifeatures.layer import FunctionRegistry
+from tifeatures.logger import logger
 from tifeatures.middleware import CacheControlMiddleware
+from tifeatures.resources.enums import OptionalHeader
 from tifeatures.settings import APISettings
 
 from fastapi import FastAPI
@@ -25,6 +28,7 @@ app = FastAPI(
     version=tifeatures_version,
     openapi_url="/api",
     docs_url="/api.html",
+    debug=settings.debug,
 )
 
 # custom template directory
@@ -42,7 +46,15 @@ templates = Jinja2Templates(
 )
 
 # Register endpoints.
-endpoints = Endpoints(title=settings.name, templates=templates)
+if settings.debug:
+    optional_headers = [OptionalHeader.server_timing]
+    logger.setLevel(logging.DEBUG)
+else:
+    optional_headers = []
+
+endpoints = Endpoints(
+    title=settings.name, templates=templates, optional_headers=optional_headers
+)
 app.include_router(endpoints.router)
 
 # We add the function registry to the application state

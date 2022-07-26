@@ -60,3 +60,9 @@ class FilterLang(str, Enum):
 
     cql2_text = "cql2-text"
     cql2_json = "cql2-json"
+
+
+class OptionalHeader(str, Enum):
+    """Optional Header to add in responses."""
+
+    server_timing = "Server-Timing"
