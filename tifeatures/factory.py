@@ -5,6 +5,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Generator, Iterable, List, Optional
 
+import buildpg
 import jinja2
 from pygeofilter.ast import AstType
 
@@ -564,7 +565,7 @@ class Endpoints:
                 description="Limits the number of features in the response.",
             ),
             offset: Optional[int] = Query(
-                None,
+                0,
                 ge=0,
                 description="Starts the response at an offset.",
             ),
@@ -578,9 +579,12 @@ class Endpoints:
                 description="Simplify the output geometry to given threshold in decimal degrees.",
             ),
             output_type: Optional[MediaType] = Depends(ItemsOutputType),
+            count_exact: Optional[bool] = Query(
+                False,
+                description="Return an exact count of features rather than an estimate.",
+            ),
         ):
-            offset = offset or 0
-
+            pool = request.app.state.pool
             # <p_NAME>=VALUE - filter features for a property having a value. Multiple property filters are ANDed together.
             # We exclude  application known query-parameter.
             exclude = [
@@ -605,195 +609,234 @@ class Endpoints:
                 for (key, value) in request.query_params.items()
                 if key.lower() not in exclude and key.lower() in table_property
             ]
+            _select = collection._select(properties)
+            _select += buildpg.logic.Empty().comma(
+                buildpg.V(collection.id_column).as_("itemid")
+            )
+            _geom = collection._geom(geom_column, bbox_only, simplify)
+            if _geom:
+                _select += buildpg.logic.Empty().comma(_geom)
 
-            items, matched_items = await collection.features(
-                request.app.state.pool,
-                ids_filter=ids_filter,
-                bbox_filter=bbox_filter,
-                datetime_filter=datetime_filter,
-                properties_filter=properties_filter,
-                cql_filter=cql_filter,
-                sortby=sortby,
-                properties=properties,
-                limit=limit,
-                offset=offset,
+            _from = collection._from()
+            _where = collection._where(
+                ids=ids_filter,
+                datetime=datetime_filter,
+                bbox=bbox_filter,
+                properties=properties_filter,
+                cql=cql_filter,
                 geom=geom_column,
                 dt=datetime_column,
-                bbox_only=bbox_only,
-                simplify=simplify,
             )
+            _sortby = collection._sortby(sortby, limit, offset)
+            _features = _select + _from + _where + _sortby
+            total_count = await collection.query_count(pool, _from, _where, count_exact)
+            if total_count == 0:
+                raise NotFound
+            print(total_count)
+            print(output_type)
 
-            if output_type in (
-                MediaType.csv,
-                MediaType.json,
-                MediaType.ndjson,
-            ):
-                if items and items[0].geometry is not None:
-                    rows = (
-                        {
-                            "collectionId": collection.id,
-                            "itemId": f.id,
-                            **f.properties,
-                            "geometry": f.geometry.wkt,
-                        }
-                        for f in items
-                    )
-
-                else:
-                    rows = (
-                        {
-                            "collectionId": collection.id,
-                            "itemId": f.id,
-                            **f.properties,
-                        }
-                        for f in items
-                    )
-
-                # CSV Response
-                if output_type == MediaType.csv:
-                    return StreamingResponse(
-                        create_csv_rows(rows),
-                        media_type=MediaType.csv,
-                        headers={
-                            "Content-Disposition": "attachment;filename=items.csv"
-                        },
-                    )
-
-                # JSON Response
-                if output_type == MediaType.json:
-                    return JSONResponse([row for row in rows])
-
-                # NDJSON Response
-                if output_type == MediaType.ndjson:
-                    return StreamingResponse(
-                        (json.dumps(row) + "\n" for row in rows),
-                        media_type=MediaType.ndjson,
-                        headers={
-                            "Content-Disposition": "attachment;filename=items.ndjson"
-                        },
-                    )
+            collection_href = str(
+                self.url_for(
+                    request,
+                    "collection",
+                    collectionId=collection.id,
+                )
+            )
 
             qs = "?" + str(request.query_params) if request.query_params else ""
-            links = [
-                model.Link(
-                    title="Collection",
-                    href=self.url_for(
-                        request, "collection", collectionId=collection.id
-                    ),
-                    rel="collection",
-                    type=MediaType.json,
-                ),
-                model.Link(
-                    title="Items",
-                    href=self.url_for(request, "items", collectionId=collection.id)
-                    + qs,
-                    rel="self",
-                    type=MediaType.geojson,
-                ),
-            ]
 
-            items_returned = len(items)
-
-            if (matched_items - items_returned) > offset:
-                next_offset = offset + items_returned
-                query_params = QueryParams(
-                    {**request.query_params, "offset": next_offset}
-                )
-                url = (
-                    self.url_for(request, "items", collectionId=collection.id)
-                    + f"?{query_params}"
-                )
-                links.append(
-                    model.Link(
-                        href=url,
-                        rel="next",
-                        type=MediaType.geojson,
-                        title="Next page",
-                    ),
-                )
-
-            if offset:
-                query_params = dict(request.query_params)
-                query_params.pop("offset")
-                prev_offset = max(offset - items_returned, 0)
-                if prev_offset:
-                    query_params = QueryParams({**query_params, "offset": prev_offset})
-                else:
-                    query_params = QueryParams({**query_params})
-
-                url = self.url_for(request, "items", collectionId=collection.id)
-                if query_params:
-                    url += f"?{query_params}"
-
-                links.append(
-                    model.Link(
-                        href=url,
-                        rel="prev",
-                        type=MediaType.geojson,
-                        title="Previous page",
-                    ),
-                )
-
-            data = model.Items(
-                id=collection.id,
-                title=collection.title or collection.id,
-                description=collection.description or collection.title or collection.id,
-                numberMatched=matched_items,
-                numberReturned=items_returned,
-                links=links,
-                features=[
-                    model.Item(
-                        **{
-                            **feature.dict(),
-                            "links": [
-                                model.Link(
-                                    title="Collection",
-                                    href=self.url_for(
-                                        request,
-                                        "collection",
-                                        collectionId=collection.id,
-                                    ),
-                                    rel="collection",
-                                    type=MediaType.json,
-                                ),
-                                model.Link(
-                                    title="Item",
-                                    href=self.url_for(
-                                        request,
-                                        "item",
-                                        collectionId=collection.id,
-                                        itemId=feature.properties[collection.id_column],
-                                    ),
-                                    rel="item",
-                                    type=MediaType.json,
-                                ),
-                            ],
-                        }
-                    )
-                    for feature in items
-                ],
-            )
-
-            # HTML Response
-            if output_type == MediaType.html:
-                return self._create_html_response(
-                    request,
-                    data.json(exclude_none=True),
-                    template_name="items",
-                )
-
-            # GeoJSONSeq Response
-            elif output_type == MediaType.geojsonseq:
+            if output_type == MediaType.geojsonseq:
                 return StreamingResponse(
-                    data.json_seq(exclude_none=True),
+                    collection.query_geojson_rows(pool, _features, collection_href),
                     media_type=MediaType.geojsonseq,
                     headers={
-                        "Content-Disposition": "attachment;filename=items.geojson"
+                        "Content-Disposition": "attachment;filename=items.geojsonseq"
                     },
                 )
 
-            # Default to GeoJSON Response
-            return data
+            if output_type == MediaType.geojson:
+                return StreamingResponse(
+                    collection.query_geojson(
+                        pool,
+                        _features,
+                        collection_href,
+                        total_count,
+                        query_params=request.query_params,
+                    ),
+                    media_type=MediaType.geojson,
+                )
+
+            # if output_type in (
+            #     MediaType.csv,
+            #     MediaType.json,
+            #     MediaType.ndjson,
+            # ):
+            #     if items and items[0].geometry is not None:
+            #         rows = (
+            #             {
+            #                 "collectionId": collection.id,
+            #                 "itemId": f.id,
+            #                 **f.properties,
+            #                 "geometry": f.geometry.wkt,
+            #             }
+            #             for f in items
+            #         )
+
+            #     else:
+            #         rows = (
+            #             {
+            #                 "collectionId": collection.id,
+            #                 "itemId": f.id,
+            #                 **f.properties,
+            #             }
+            #             for f in items
+            #         )
+
+            #     # CSV Response
+            #     if output_type == MediaType.csv:
+            #         return StreamingResponse(
+            #             create_csv_rows(rows),
+            #             media_type=MediaType.csv,
+            #             headers={
+            #                 "Content-Disposition": "attachment;filename=items.csv"
+            #             },
+            #         )
+
+            #     # JSON Response
+            #     if output_type == MediaType.json:
+            #         return JSONResponse([row for row in rows])
+
+            #     # NDJSON Response
+            #     if output_type == MediaType.ndjson:
+            #         return StreamingResponse(
+            #             (json.dumps(row) + "\n" for row in rows),
+            #             media_type=MediaType.ndjson,
+            #             headers={
+            #                 "Content-Disposition": "attachment;filename=items.ndjson"
+            #             },
+            #         )
+
+            # qs = "?" + str(request.query_params) if request.query_params else ""
+            # links = [
+            #     model.Link(
+            #         title="Collection",
+            #         href=self.url_for(
+            #             request, "collection", collectionId=collection.id
+            #         ),
+            #         rel="collection",
+            #         type=MediaType.json,
+            #     ),
+            #     model.Link(
+            #         title="Items",
+            #         href=self.url_for(request, "items", collectionId=collection.id)
+            #         + qs,
+            #         rel="self",
+            #         type=MediaType.geojson,
+            #     ),
+            # ]
+
+            # items_returned = len(items)
+
+            # if (matched_items - items_returned) > offset:
+            #     next_offset = offset + items_returned
+            #     query_params = QueryParams(
+            #         {**request.query_params, "offset": next_offset}
+            #     )
+            #     url = (
+            #         self.url_for(request, "items", collectionId=collection.id)
+            #         + f"?{query_params}"
+            #     )
+            #     links.append(
+            #         model.Link(
+            #             href=url,
+            #             rel="next",
+            #             type=MediaType.geojson,
+            #             title="Next page",
+            #         ),
+            #     )
+
+            # if offset:
+            #     query_params = dict(request.query_params)
+            #     query_params.pop("offset")
+            #     prev_offset = max(offset - items_returned, 0)
+            #     if prev_offset:
+            #         query_params = QueryParams({**query_params, "offset": prev_offset})
+            #     else:
+            #         query_params = QueryParams({**query_params})
+
+            #     url = self.url_for(request, "items", collectionId=collection.id)
+            #     if query_params:
+            #         url += f"?{query_params}"
+
+            #     links.append(
+            #         model.Link(
+            #             href=url,
+            #             rel="prev",
+            #             type=MediaType.geojson,
+            #             title="Previous page",
+            #         ),
+            #     )
+
+            # data = model.Items(
+            #     id=collection.id,
+            #     title=collection.title or collection.id,
+            #     description=collection.description or collection.title or collection.id,
+            #     numberMatched=matched_items,
+            #     numberReturned=items_returned,
+            #     links=links,
+            #     features=[
+            #         model.Item(
+            #             **{
+            #                 **feature.dict(),
+            #                 "links": [
+            #                     model.Link(
+            #                         title="Collection",
+            #                         href=self.url_for(
+            #                             request,
+            #                             "collection",
+            #                             collectionId=collection.id,
+            #                         ),
+            #                         rel="collection",
+            #                         type=MediaType.json,
+            #                     ),
+            #                     model.Link(
+            #                         title="Item",
+            #                         href=self.url_for(
+            #                             request,
+            #                             "item",
+            #                             collectionId=collection.id,
+            #                             itemId=feature.properties[collection.id_column],
+            #                         ),
+            #                         rel="item",
+            #                         type=MediaType.json,
+            #                     ),
+            #                 ],
+            #             }
+            #         )
+            #         for feature in items
+            #     ],
+            # )
+
+            # # HTML Response
+            # if output_type == MediaType.html:
+            #     return self._create_html_response(
+            #         request,
+            #         data.json(exclude_none=True),
+            #         template_name="items",
+            #     )
+
+            # # GeoJSONSeq Response
+            # elif output_type == MediaType.geojsonseq:
+            #     return StreamingResponse(
+            #         data.json_seq(exclude_none=True),
+            #         media_type=MediaType.geojsonseq,
+            #         headers={
+            #             "Content-Disposition": "attachment;filename=items.geojson"
+            #         },
+            #     )
+
+            # # Default to GeoJSON Response
+            # return data
 
         @self.router.get(
             "/collections/{collectionId}/items/{itemId}",
