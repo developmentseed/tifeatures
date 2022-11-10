@@ -3,11 +3,12 @@
 from typing import Any, Dict, List, Optional
 
 from buildpg import asyncpg
-from pydantic import BaseModel, Field, root_validator, validator
+from pydantic import BaseModel, Field, PrivateAttr, root_validator, validator
 
-from tifeatures.settings import APISettings, TableConfig
+from tifeatures.model import TableConfig
+from tifeatures.settings import DBModelSettings
 
-settings = APISettings()
+settings = DBModelSettings()
 
 
 class Column(BaseModel):
@@ -20,12 +21,10 @@ class Column(BaseModel):
     @property
     def json_type(self) -> str:
         """Return JSON field type."""
-        pgtype = self.type
-
-        if pgtype.endswith("[]"):
+        if self.type.endswith("[]"):
             return "array"
 
-        if pgtype in [
+        if self.type in [
             "smallint",
             "integer",
             "bigint",
@@ -43,10 +42,10 @@ class Column(BaseModel):
         ]:
             return "number"
 
-        if pgtype.startswith("bool"):
+        if self.type.startswith("bool"):
             return "boolean"
 
-        if any([pgtype.startswith("json"), pgtype.startswith("geo")]):
+        if any([self.type.startswith("json"), self.type.startswith("geo")]):
             return "object"
 
         return "string"
@@ -70,12 +69,14 @@ class DatetimeColumn(Column):
 class Table(BaseModel):
     """Model for DB Table."""
 
-    properties: List[Column] = []
-    table_config: TableConfig = TableConfig.construct()
     id: str
     table: str
     dbschema: str = Field(..., alias="schema")
     description: Optional[str]
+    properties: List[Column] = []
+
+    _table_config: TableConfig = PrivateAttr(default_factory=TableConfig)
+
     id_column: Optional[str]
     geometry_columns: List[GeometryColumn] = []
     datetime_columns: List[DatetimeColumn] = []
@@ -84,18 +85,21 @@ class Table(BaseModel):
     def validate_table_config(cls, values):
         """Get table configurations from settings."""
         id = values.get("id").replace(".", "_")
-        if settings.table_config and id in settings.table_config:
-            values["table_config"] = settings.table_config.get(id)
+        if settings.table_config.get(id):
+            values["_table_config"] = settings.table_config.get(id)
+
         return values
 
     @validator("id_column", always=True)
     def validate_id_column(cls, v, values):
         """Get primary key."""
-        table_config = values.get("table_config", None)
-        if table_config.pk is not None:
-            return table_config.pk
+        table_config = values.get("_table_config")
+        if table_config and table_config.get("pk"):
+            return table_config["pk"]
+
         if v is not None:
             return v
+
         if settings.fallback_key_names:
             for c in values.get("properties", []):
                 if c.name in settings.fallback_key_names:
@@ -106,14 +110,17 @@ class Table(BaseModel):
         """Validate List Columns."""
         if v is None:
             return []
+
         return v
 
     def datetime_column(self, name: Optional[str] = None) -> Optional[Column]:
         """Return the Column for either the passed in tstz column or the first tstz column."""
         if not self.datetime_columns:
             return None
+
         if name is None:
-            name = getattr(self.table_config, "datetimecol", None)
+            name = self._table_config.get("datetimecol", None)
+
         for col in self.datetime_columns:
             if name is None or col.name == name:
                 return col
@@ -124,10 +131,13 @@ class Table(BaseModel):
         """Return the name of the first geometry column."""
         if not self.geometry_columns:
             return None
+
         if name and name.lower() == "none":
             return None
+
         if name is None:
-            name = getattr(self.table_config, "geomcol", None)
+            name = self._table_config.get("geomcol", None)
+
         for col in self.geometry_columns:
             if name is None or col.name == name:
                 return col

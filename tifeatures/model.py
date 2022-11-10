@@ -1,11 +1,22 @@
 """tifeatures models."""
 
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, TypedDict
 
 from geojson_pydantic import Feature, FeatureCollection
 from pydantic import BaseModel, Field
 
 from tifeatures.resources.enums import MediaType
+
+
+class TableConfig(TypedDict, total=False):
+    """Configuration to add table options with env variables."""
+
+    geomcol: Optional[str]
+    datetimecol: Optional[str]
+    extent: Optional[List[float]]
+    temporalextent: Optional[List[str]]
+    pk: Optional[str]
+    properties: Optional[List[str]]
 
 
 class Link(BaseModel):
