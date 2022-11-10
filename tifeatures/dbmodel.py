@@ -65,9 +65,16 @@ class DatetimeColumn(Column):
     max: Optional[str]
 
 
+class Parameter(Column):
+    """Model for PostGIS function parameters."""
+
+    default: Optional[str] = None
+
+
 class Table(BaseModel):
     """Model for DB Table."""
 
+    type: str
     id: str
     table: str
     dbschema: str = Field(..., alias="schema")
@@ -78,6 +85,7 @@ class Table(BaseModel):
     datetime_columns: List[DatetimeColumn] = []
     geometry_column: Optional[GeometryColumn]
     datetime_column: Optional[DatetimeColumn]
+    parameters: List[Parameter] = []
 
     def get_datetime_column(self, name: Optional[str] = None) -> Optional[Column]:
         """Return the Column for either the passed in tstz column or the first tstz column."""
@@ -144,6 +152,7 @@ async def get_table_index(
     db_pool: asyncpg.BuildPgPool,
     schemas: Optional[List[str]] = ["public"],
     tables: Optional[List[str]] = None,
+    functions: Optional[List[str]] = None,
     spatial: bool = True,
 ) -> Database:
     """Fetch Table index."""
@@ -158,7 +167,7 @@ async def get_table_index(
                 obj_description(c.oid, 'pg_class') as description,
                 attname,
                 atttypmod,
-                replace(replace(replace(replace(format_type(atttypid, null),'character varying','text'),'double precision','float8'),'timestamp with time zone','timestamptz'),'timestamp without time zone','timestamp') as "type",
+                replace(replace(replace(replace(format_type(atttypid, null),'character varying','text'),'double precision','float8'),'timestamp with time zone','timestamptz'),'timestamp without time zone','timestamp') as typ,
                 col_description(attrelid, attnum)
             FROM
                 pg_class c
@@ -175,10 +184,10 @@ async def get_table_index(
         ),
         grouped as
         (SELECT
-            nspname,
-            relname,
+            'Table' as entity,
+            nspname as dbschema,
+            relname as tbl,
             id,
-            t_oid,
             description,
             (
                 SELECT attname
@@ -202,10 +211,10 @@ async def get_table_index(
             coalesce(jsonb_agg(
                 jsonb_build_object(
                     'name', attname,
-                    'type', "type",
+                    'type', typ,
                     'geometry_type', postgis_typmod_type(atttypmod),
                     'srid', postgis_typmod_srid(atttypmod),
-                    'description', description,
+                    'description', col_description,
                     'bounds',
                         CASE WHEN postgis_typmod_srid(atttypmod) IS NOT NULL AND postgis_typmod_srid(atttypmod) != 0 THEN
                             (
@@ -233,35 +242,110 @@ async def get_table_index(
                         ELSE ARRAY[-180,-90,180,90]
                         END
                 )
-            ) FILTER (WHERE "type" IN ('geometry','geography')), '[]'::jsonb) as geometry_columns,
+            ) FILTER (WHERE typ IN ('geometry','geography')), '[]'::jsonb) as geometry_columns,
             coalesce(jsonb_agg(
                 jsonb_build_object(
                     'name', attname,
-                    'type', "type",
-                    'description', description
+                    'type', typ,
+                    'description', col_description
                 )
-            ) FILTER (WHERE type LIKE 'timestamp%'), '[]'::jsonb) as datetime_columns,
+            ) FILTER (WHERE typ LIKE 'timestamp%'), '[]'::jsonb) as datetime_columns,
             coalesce(jsonb_agg(
                 jsonb_build_object(
                     'name', attname,
-                    'type', "type",
-                    'description', description
+                    'type', typ,
+                    'description', col_description
                 )
-            ),'[]'::jsonb) as properties
+            ),'[]'::jsonb) as properties,
+            '[]'::jsonb as parameters
         FROM
             table_columns
-        GROUP BY 1,2,3,4,5,6 ORDER BY 1,2
-        )
+        GROUP BY 1,2,3,4,5,6 ORDER BY 1,2,3,4
+        ),
+        f AS (
+            SELECT
+                'Function' as entity,
+                nspname as dbschema,
+                proname as tbl,
+                format('%s.%s',nspname, proname) as id,
+                d.description as description,
+                CASE WHEN pronargdefaults > 0 AND pronargs > 0 THEN
+                    array_fill(
+                        NULL::text,
+                        ARRAY[pronargs-pronargdefaults]
+                    ) || string_to_array(pg_get_expr(p.proargdefaults, 0::OID),',')
+                ELSE array_fill(null::text, ARRAY[pronargs])
+                END as defaults,
+                p.proallargtypes,
+                p.proargmodes,
+                p.proargnames
+
+            FROM
+                pg_proc p
+                JOIN
+                pg_namespace n on (p.pronamespace=n.oid)
+                LEFT JOIN pg_description d ON (p.oid = d.objoid)
+            WHERE
+                proretset
+                AND nspname='public'
+                AND prokind='f'
+                AND proargnames is not null
+                AND '' != ANY(proargnames)
+                AND has_function_privilege(p.oid, 'execute')
+                AND has_schema_privilege(n.oid, 'usage')
+                AND provariadic=0
+                AND cardinality(p.proargnames) = cardinality(p.proargmodes)
+                AND cardinality(p.proargmodes) = cardinality(p.proallargtypes)
+        ), functions as (
         SELECT
+            entity,
+            dbschema,
+            tbl,
             id,
-            relname as table,
-            nspname as dbschema,
             description,
-            id_column,
-            geometry_columns,
-            datetime_columns,
-            properties
-        FROM grouped
+            null::text as id_column,
+            coalesce(jsonb_agg(
+                jsonb_strip_nulls(jsonb_build_object(
+                    'name', a.argname,
+                    'type', replace(replace(replace(replace(format_type(argtype, null),'character varying','text'),'double precision','float8'),'timestamp with time zone','timestamptz'),'timestamp without time zone','timestamp'),
+                    'geometry_type', 'Geometry'
+                ))
+                ORDER BY a.argnum
+            ) FILTER (WHERE argmode IN ('t', 'b', 'o') AND format_type(argtype, null) LIKE 'geo%'),'[]'::jsonb) as geometry_columns,
+            coalesce(jsonb_agg(
+                jsonb_strip_nulls(jsonb_build_object(
+                    'name', a.argname,
+                    'type', replace(replace(replace(replace(format_type(argtype, null),'character varying','text'),'double precision','float8'),'timestamp with time zone','timestamptz'),'timestamp without time zone','timestamp')
+                ))
+                ORDER BY a.argnum
+            ) FILTER (WHERE argmode IN ('t', 'b', 'o') AND format_type(argtype, null) LIKE 'timestamp%'),'[]'::jsonb) as datetime_columns,
+            coalesce(jsonb_agg(
+                jsonb_build_object(
+                    'name', a.argname,
+                    'type', replace(replace(replace(replace(format_type(argtype, null),'character varying','text'),'double precision','float8'),'timestamp with time zone','timestamptz'),'timestamp without time zone','timestamp')
+                )
+                ORDER BY a.argnum
+            ) FILTER (WHERE argmode IN ('t', 'b', 'o')),'[]'::jsonb) as properties,
+            coalesce(jsonb_agg(
+                jsonb_strip_nulls(jsonb_build_object(
+                    'name', a.argname,
+                    'type', replace(replace(replace(replace(format_type(argtype, null),'character varying','text'),'double precision','float8'),'timestamp with time zone','timestamptz'),'timestamp without time zone','timestamp')
+                    ,'default', regexp_replace(def, '''([a-zA-Z0-9_\-\.]+)''::\w+', '\1', 'g')
+                ))
+                ORDER BY a.argnum
+            ) FILTER (WHERE argmode IN ('i', 'b')),'[]'::jsonb) as parameters
+
+        FROM
+            f
+            LEFT JOIN LATERAL unnest(f.proallargtypes,f.proargmodes,f.proargnames,f.defaults) WITH ORDINALITY AS a(argtype,argmode,argname,def,argnum) ON TRUE
+        GROUP BY 1,2,3,4,5,6 ORDER BY 1,2,3,4
+        ),
+        unioned as (
+        SELECT * FROM grouped
+        UNION ALL
+        SELECT * FROM functions
+        )
+        SELECT * FROM unioned
         WHERE :spatial = FALSE OR jsonb_array_length(geometry_columns)>=1
         ;
 
@@ -272,6 +356,7 @@ async def get_table_index(
             query,
             schemas=schemas,
             tables=tables,
+            functions=functions,
             spatial=spatial,
         )
         catalog = {}
@@ -326,8 +411,9 @@ async def get_table_index(
                 geometry_column = geometry_columns[0]
 
             catalog[id] = {
+                "type": table["entity"],
                 "id": id,
-                "table": table["table"],
+                "table": table["tbl"],
                 "schema": table["dbschema"],
                 "description": table["description"],
                 "id_column": id_column,
@@ -336,6 +422,101 @@ async def get_table_index(
                 "properties": properties,
                 "datetime_column": datetime_column,
                 "geometry_column": geometry_column,
+                "parameters": table["parameters"],
             }
 
+        return catalog
+
+
+async def get_function_index(
+    db_pool: asyncpg.BuildPgPool,
+    schemas: Optional[List[str]] = ["public"],
+    functions: Optional[List[str]] = None,
+    spatial: bool = True,
+) -> Database:
+    """Fetch Function index."""
+
+    query = """
+        WITH f AS (
+            SELECT
+                p.oid,
+                proname,
+                nspname,
+                d.description as description,
+                pg_get_function_arguments(p.oid) args,
+                CASE WHEN pronargdefaults > 0 AND pronargs > 0 THEN
+                    array_fill(
+                        NULL::text,
+                        ARRAY[pronargs-pronargdefaults]
+                    ) || string_to_array(pg_get_expr(p.proargdefaults, 0::OID),',')
+                ELSE array_fill(null::text, ARRAY[pronargs])
+                END as defaults,
+                p.proallargtypes,
+                p.proargmodes,
+                p.proargnames
+
+            FROM
+                pg_proc p
+                JOIN
+                pg_namespace n on (p.pronamespace=n.oid)
+                LEFT JOIN pg_description d ON (p.oid = d.objoid)
+            WHERE
+                proretset
+                AND nspname='public'
+                AND prokind='f'
+                AND proargnames is not null
+                AND '' != ANY(proargnames)
+                AND has_function_privilege(p.oid, 'execute')
+                AND has_schema_privilege(n.oid, 'usage')
+                AND provariadic=0
+                AND cardinality(p.proargnames) = cardinality(p.proargmodes)
+                AND cardinality(p.proargmodes) = cardinality(p.proallargtypes)
+        )
+        SELECT
+            proname as table,
+            nspname as dbschema,
+            format('%s.%s',nspname, proname) as id,
+            '' as description,
+            jsonb_agg(
+                jsonb_strip_nulls(jsonb_build_object(
+                    'name', a.argname,
+                    'type', replace(replace(replace(replace(format_type(argtype, null),'character varying','text'),'double precision','float8'),'timestamp with time zone','timestamptz'),'timestamp without time zone','timestamp'),
+                    'default', regexp_replace(def, '''([a-zA-Z0-9_\-\.]+)''::\w+', '\1', 'g')
+                ))
+                ORDER BY a.argnum
+            ) FILTER (WHERE argmode IN ('i', 'b')) as parameters,
+            jsonb_agg(
+                jsonb_build_object(
+                    'name', a.argname,
+                    'type', replace(replace(replace(replace(format_type(argtype, null),'character varying','text'),'double precision','float8'),'timestamp with time zone','timestamptz'),'timestamp without time zone','timestamp')
+                )
+                ORDER BY a.argnum
+            ) FILTER (WHERE argmode IN ('t', 'b', 'o')) as properties
+
+        FROM
+            f
+            LEFT JOIN LATERAL unnest(f.proallargtypes,f.proargmodes,f.proargnames,f.defaults) WITH ORDINALITY AS a(argtype,argmode,argname,def,argnum) ON TRUE
+        GROUP BY 1,2,3,4
+
+        ;
+    """
+
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch_b(
+            query,
+            schemas=schemas,
+            functions=functions,
+            spatial=spatial,
+        )
+        catalog = {}
+        for row in rows:
+            func = dict(row)
+            id = func["id"]
+            func["geometry_columns"] = [
+                c for c in func["properties"] if c["type"].startswith("geo")
+            ]
+            func["datetime_columns"] = [
+                c for c in func["properties"] if c["type"].startswith("timestamp")
+            ]
+            catalog[id] = func
         return catalog
