@@ -353,8 +353,7 @@ async def get_table_index(
         SELECT * FROM unioned
         WHERE :spatial = FALSE OR jsonb_array_length(geometry_columns)>=1
         ;
-
-    """
+    """  # noqa: W605
 
     async with db_pool.acquire() as conn:
         rows = await conn.fetch_b(
@@ -509,7 +508,7 @@ async def get_function_index(
         GROUP BY 1,2,3,4
 
         ;
-    """
+    """  # noqa: W605
 
     async with db_pool.acquire() as conn:
         rows = await conn.fetch_b(
