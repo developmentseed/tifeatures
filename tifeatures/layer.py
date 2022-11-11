@@ -146,7 +146,7 @@ class Table(CollectionLayer, DBTable):
                 simplify,
             )
 
-        g = logic.Func("ST_AsGeoJson", g)
+        g = pg_funcs.cast(logic.Func("ST_AsGeoJson", g), "JSONB")
 
         return g
 
@@ -432,7 +432,7 @@ class Table(CollectionLayer, DBTable):
             items = await conn.fetchval(q, *p)
 
         return (
-            FeatureCollection(features=items.get("features") or []),
+            {"type": "FeatureCollection", "features": items.get("features") or []},
             items["total_count"],
         )
 
@@ -477,8 +477,8 @@ class Table(CollectionLayer, DBTable):
             properties=properties,
             **kwargs,
         )
-        if len(feature_collection):
-            return feature_collection.features[0]
+        if len(feature_collection["features"]):
+            return feature_collection["features"][0]
 
         return None
 
