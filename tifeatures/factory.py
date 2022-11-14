@@ -23,6 +23,7 @@ from tifeatures.dependencies import (
     sortby_query,
 )
 from tifeatures.errors import NotFound
+from tifeatures.geojson import geojson_to_wkt
 from tifeatures.layer import CollectionLayer
 from tifeatures.layer import Table as TableLayer
 from tifeatures.resources.enums import MediaType
@@ -625,16 +626,15 @@ class Endpoints:
                 MediaType.ndjson,
             ):
                 if items["features"] and items["features"][0]["geometry"] is not None:
-                    raise Exception("Not available")
-                    # rows = (
-                    #     {
-                    #         "collectionId": collection.id,
-                    #         "itemId": f.id,
-                    #         **f.properties,
-                    #         "geometry": f.geometry.wkt,
-                    #     }
-                    #     for f in items
-                    # )
+                    rows = (
+                        {
+                            "collectionId": collection.id,
+                            "itemId": f["id"],
+                            **f.get("properties", {}),
+                            "geometry": geojson_to_wkt(f["geometry"]),
+                        }
+                        for f in items["features"]
+                    )
 
                 else:
                     rows = (
@@ -769,46 +769,6 @@ class Endpoints:
                 ],
             )
 
-            # data = model.Items(
-            #     id=collection.id,
-            #     title=collection.title or collection.id,
-            #     description=collection.description or collection.title or collection.id,
-            #     numberMatched=matched_items,
-            #     numberReturned=items_returned,
-            #     links=links,
-            #     features=[
-            #         model.Item(
-            #             **{
-            #                 **feature.dict(),
-            #                 "links": [
-            #                     model.Link(
-            #                         title="Collection",
-            #                         href=self.url_for(
-            #                             request,
-            #                             "collection",
-            #                             collectionId=collection.id,
-            #                         ),
-            #                         rel="collection",
-            #                         type=MediaType.json,
-            #                     ),
-            #                     model.Link(
-            #                         title="Item",
-            #                         href=self.url_for(
-            #                             request,
-            #                             "item",
-            #                             collectionId=collection.id,
-            #                             itemId=feature.properties[collection.id_column],
-            #                         ),
-            #                         rel="item",
-            #                         type=MediaType.json,
-            #                     ),
-            #                 ],
-            #             }
-            #         )
-            #         for feature in items
-            #     ],
-            # )
-
             # HTML Response
             if output_type == MediaType.html:
                 return self._create_html_response(
@@ -883,29 +843,6 @@ class Endpoints:
                     ).dict(exclude_none=True),
                 ],
             )
-
-            # data = model.Item(
-            #     **feature.dict(),
-            #     links=[
-            #         model.Link(
-            #             href=self.url_for(
-            #                 request, "collection", collectionId=collection.id
-            #             ),
-            #             rel="collection",
-            #             type=MediaType.json,
-            #         ),
-            #         model.Link(
-            #             href=self.url_for(
-            #                 request,
-            #                 "item",
-            #                 collectionId=collection.id,
-            #                 itemId=itemId,
-            #             ),
-            #             rel="self",
-            #             type=MediaType.geojson,
-            #         ),
-            #     ],
-            # )
 
             # HTML Response
             if output_type == MediaType.html:
