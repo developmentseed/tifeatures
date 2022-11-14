@@ -26,11 +26,7 @@ from tifeatures.errors import NotFound
 from tifeatures.layer import CollectionLayer
 from tifeatures.layer import Table as TableLayer
 from tifeatures.resources.enums import MediaType
-from tifeatures.resources.response import (
-    GeoJSONResponse,
-    JSONResponse,
-    SchemaJSONResponse,
-)
+from tifeatures.resources.response import JSONResponse, SchemaJSONResponse
 
 from fastapi import APIRouter, Depends, Path, Query
 
@@ -647,7 +643,7 @@ class Endpoints:
                             "itemId": f["id"],
                             **f["properties"],
                         }
-                        for f in items
+                        for f in items["features"]
                     )
 
                 # CSV Response
