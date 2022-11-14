@@ -27,7 +27,11 @@ from tifeatures.geojson import geojson_to_wkt
 from tifeatures.layer import CollectionLayer
 from tifeatures.layer import Table as TableLayer
 from tifeatures.resources.enums import MediaType
-from tifeatures.resources.response import JSONResponse, SchemaJSONResponse
+from tifeatures.resources.response import (
+    GeoJSONResponse,
+    JSONResponse,
+    SchemaJSONResponse,
+)
 
 from fastapi import APIRouter, Depends, Path, Query
 
@@ -521,9 +525,7 @@ class Endpoints:
 
         @self.router.get(
             "/collections/{collectionId}/items",
-            response_model=model.Items,
-            response_model_exclude_none=True,
-            response_class=JSONResponse,
+            response_class=GeoJSONResponse,
             responses={
                 200: {
                     "content": {
@@ -533,7 +535,8 @@ class Endpoints:
                         MediaType.json.value: {},
                         MediaType.geojsonseq.value: {},
                         MediaType.ndjson.value: {},
-                    }
+                    },
+                    "model": model.Items,
                 },
             },
         )
@@ -641,7 +644,7 @@ class Endpoints:
                         {
                             "collectionId": collection.id,
                             "itemId": f["id"],
-                            **f["properties"],
+                            **f.get("properties", {}),
                         }
                         for f in items["features"]
                     )
@@ -731,14 +734,17 @@ class Endpoints:
                     ).dict(exclude_none=True),
                 )
 
-            data = dict(
-                id=collection.id,
-                title=collection.title or collection.id,
-                description=collection.description or collection.title or collection.id,
-                numberMatched=matched_items,
-                numberReturned=items_returned,
-                links=links,
-                features=[
+            data = {
+                "type": "FeatureCollection",
+                "id": collection.id,
+                "title": collection.title or collection.id,
+                "description": collection.description
+                or collection.title
+                or collection.id,
+                "numberMatched": matched_items,
+                "numberReturned": items_returned,
+                "links": links,
+                "features": [
                     {
                         **feature,
                         "links": [
@@ -767,7 +773,7 @@ class Endpoints:
                     }
                     for feature in items["features"]
                 ],
-            )
+            }
 
             # HTML Response
             if output_type == MediaType.html:
@@ -792,16 +798,15 @@ class Endpoints:
 
         @self.router.get(
             "/collections/{collectionId}/items/{itemId}",
-            response_model=model.Item,
-            response_model_exclude_none=True,
-            response_class=JSONResponse,
+            response_class=GeoJSONResponse,
             responses={
                 200: {
                     "content": {
                         MediaType.geojson.value: {},
                         MediaType.html.value: {},
                         MediaType.json.value: {},
-                    }
+                    },
+                    "model": model.Item,
                 },
             },
         )
@@ -821,9 +826,9 @@ class Endpoints:
                     f"Item {itemId} in Collection {collection.id} does not exist."
                 )
 
-            data = dict(
+            data = {
                 **feature,
-                links=[
+                "links": [
                     model.Link(
                         href=self.url_for(
                             request, "collection", collectionId=collection.id
@@ -842,7 +847,7 @@ class Endpoints:
                         type=MediaType.geojson,
                     ).dict(exclude_none=True),
                 ],
-            )
+            }
 
             # HTML Response
             if output_type == MediaType.html:
