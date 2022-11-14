@@ -618,12 +618,17 @@ class Endpoints:
                 "simplify",
                 "sortby",
             ]
+            properties_filter = []
+            function_parameters = {}
             table_property = [prop.name for prop in collection.properties]
-            properties_filter = [
-                (key, value)
-                for (key, value) in request.query_params.items()
-                if key.lower() not in exclude and key.lower() in table_property
-            ]
+            function_parameter_names = [p.name for p in collection.parameters]
+
+            for k, v in request.query_params.items():
+                k = k.lower()
+                if k in function_parameter_names:
+                    function_parameters[k] = v
+                elif k in table_property and k not in exclude:
+                    properties_filter.append((k, v))
 
             items, matched_items = await collection.features(
                 request.app.state.pool,
@@ -640,6 +645,7 @@ class Endpoints:
                 dt=datetime_column,
                 bbox_only=bbox_only,
                 simplify=simplify,
+                function_parameters=function_parameters,
             )
 
             if output_type in (

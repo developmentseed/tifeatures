@@ -5,7 +5,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, ClassVar, Dict, List, Optional, Tuple
 
-from buildpg import asyncpg, clauses
+from buildpg import RawDangerous, asyncpg, clauses
 from buildpg import funcs as pg_funcs
 from buildpg import logic, render
 from ciso8601 import parse_rfc3339
@@ -106,8 +106,6 @@ class Table(CollectionLayer, DBTable):
 
     """
 
-    type: str = "Table"
-
     @root_validator
     def bounds_default(cls, values):
         """Get default bounds from the first geometry columns."""
@@ -126,8 +124,25 @@ class Table(CollectionLayer, DBTable):
     def _select_count(self):
         return clauses.Select(pg_funcs.count("*"))
 
-    def _from(self):
-        return clauses.From(self.id)
+    def _from(self, function_parameters: Optional[Dict[str, str]]):
+        print("parsing from", function_parameters, self.parameters)
+        if self.type == "Function":
+            if not function_parameters:
+                print("no parameters")
+                return clauses.From(self.id) + RawDangerous("()")
+            params = []
+            for p in self.parameters:
+                print(p)
+                if p.name in function_parameters:
+                    print("appending", p.name, function_parameters[p.name])
+                    params.append(
+                        pg_funcs.cast(
+                            pg_funcs.cast(function_parameters[p.name], "text"), p.type
+                        )
+                    )
+            return clauses.From(logic.Func(self.id, *params))
+        else:
+            return clauses.From(self.id)
 
     def _geom(
         self,
@@ -309,11 +324,12 @@ class Table(CollectionLayer, DBTable):
         dt: str = None,
         limit: Optional[int] = None,
         offset: Optional[int] = None,
+        function_parameters: Optional[Dict[str, str]],
     ):
         """Build Features query."""
-        return (
+        q = (
             self._select(properties)
-            + self._from()
+            + self._from(function_parameters)
             + self._where(
                 ids=ids_filter,
                 datetime=datetime_filter,
@@ -327,6 +343,8 @@ class Table(CollectionLayer, DBTable):
             + clauses.Limit(limit or 10)
             + clauses.Offset(offset or 0)
         )
+        print("features", q)
+        return q
 
     def _features_count_query(
         self,
@@ -338,11 +356,12 @@ class Table(CollectionLayer, DBTable):
         cql_filter: Optional[AstType] = None,
         geom: str = None,
         dt: str = None,
+        function_parameters: Optional[Dict[str, str]],
     ):
         """Build features COUNT query."""
-        return (
+        q = (
             self._select_count()
-            + self._from()
+            + self._from(function_parameters)
             + self._where(
                 ids=ids_filter,
                 datetime=datetime_filter,
@@ -353,6 +372,8 @@ class Table(CollectionLayer, DBTable):
                 dt=dt,
             )
         )
+        print("features_count", q)
+        return q
 
     async def query(
         self,
@@ -362,11 +383,12 @@ class Table(CollectionLayer, DBTable):
         bbox_filter: Optional[List[float]] = None,
         datetime_filter: Optional[List[str]] = None,
         properties_filter: Optional[List[Tuple[str, str]]] = None,
+        function_parameters: Optional[Dict[str, str]] = None,
         cql_filter: Optional[AstType] = None,
         sortby: Optional[str] = None,
         properties: Optional[List[str]] = None,
-        geom: str = None,
-        dt: str = None,
+        geom: Optional[str] = None,
+        dt: Optional[str] = None,
         limit: Optional[int] = None,
         offset: Optional[int] = None,
         bbox_only: Optional[bool] = None,
@@ -375,6 +397,8 @@ class Table(CollectionLayer, DBTable):
         """Build and run Pg query."""
         if geom and geom.lower() != "none" and not self.get_geometry_column(geom):
             raise InvalidGeometryColumnName(f"Invalid Geometry Column: {geom}.")
+
+        print(self._from(function_parameters))
 
         sql_query = """
             WITH
@@ -406,8 +430,14 @@ class Table(CollectionLayer, DBTable):
                 )
             ;
         """
-        id_column = logic.V(self.id_column) or pg_funcs.cast(None, "text")
+
+        if self.id_column:
+            id_column = logic.V(self.id_column)
+        else:
+            id_column = pg_funcs.cast(None, "text")
+
         geom_columns = [g.name for g in self.geometry_columns]
+
         q, p = render(
             sql_query,
             features_q=self._features_query(
@@ -422,6 +452,7 @@ class Table(CollectionLayer, DBTable):
                 dt=dt,
                 limit=limit,
                 offset=offset,
+                function_parameters=function_parameters,
             ),
             count_q=self._features_count_query(
                 ids_filter=ids_filter,
@@ -431,6 +462,7 @@ class Table(CollectionLayer, DBTable):
                 cql_filter=cql_filter,
                 geom=geom,
                 dt=dt,
+                function_parameters=function_parameters,
             ),
             id_column=id_column,
             geometry_q=self._geom(
@@ -441,6 +473,7 @@ class Table(CollectionLayer, DBTable):
             geom_columns=geom_columns,
         )
         async with pool.acquire() as conn:
+            print(q, p)
             items = await conn.fetchval(q, *p)
 
         return (

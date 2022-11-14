@@ -6,7 +6,7 @@ import jinja2
 
 from tifeatures import __version__ as tifeatures_version
 from tifeatures.db import close_db_connection, connect_to_db, register_table_catalog
-from tifeatures.dbmodel import Table
+from tifeatures.dbmodel import Table, get_function_index
 from tifeatures.errors import DEFAULT_STATUS_CODES, add_exception_handlers
 from tifeatures.factory import Endpoints
 from tifeatures.layer import FunctionRegistry
@@ -99,3 +99,9 @@ if settings.DEBUG:
         for k, v in cat.items():
             ret[k] = Table(**v)
         return ret
+
+    @app.get("/rawfunccatalog")
+    async def raw_func_catalog(request: Request):
+        """Return parsed catalog data for testing."""
+        cat = await get_function_index(request.app.state.pool, spatial=False)
+        return cat
