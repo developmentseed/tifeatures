@@ -74,6 +74,19 @@ class CollectionLayer(BaseModel, metaclass=abc.ABCMeta):
     description: Optional[str]
 
     @abc.abstractmethod
+    async def count(
+        self,
+        pool: asyncpg.BuildPgPool,
+        ids_filter: Optional[List[str]] = None,
+        bbox_filter: Optional[List[float]] = None,
+        datetime_filter: Optional[List[str]] = None,
+        properties_filter: Optional[List[Tuple[str, Any]]] = None,
+        cql_filter: Optional[AstType] = None,
+    ) -> int:
+        """Return a Count of matched items for a query."""
+        ...
+
+    @abc.abstractmethod
     async def features(
         self,
         pool: asyncpg.BuildPgPool,
@@ -86,7 +99,7 @@ class CollectionLayer(BaseModel, metaclass=abc.ABCMeta):
         limit: Optional[int] = None,
         offset: Optional[int] = None,
         **kwargs: Any,
-    ) -> Tuple[FeatureCollection, int]:
+    ) -> FeatureCollection:
         """Return a FeatureCollection and the number of matched items."""
         ...
 
@@ -371,7 +384,7 @@ class Table(CollectionLayer, DBTable):
             )
         )
 
-    async def query(
+    async def _features(
         self,
         pool: asyncpg.BuildPgPool,
         *,
@@ -388,7 +401,7 @@ class Table(CollectionLayer, DBTable):
         offset: Optional[int] = None,
         bbox_only: Optional[bool] = None,
         simplify: Optional[float] = None,
-    ) -> Tuple[FeatureCollection, int]:
+    ) -> FeatureCollection:
         """Build and run Pg query."""
         if geom and geom.lower() != "none" and not self.get_geometry_column(geom):
             raise InvalidGeometryColumnName(f"Invalid Geometry Column: {geom}.")
@@ -397,31 +410,23 @@ class Table(CollectionLayer, DBTable):
             WITH
                 features AS (
                     :features_q
-                ),
-                total_count AS (
-                    :count_q
                 )
             SELECT json_build_object(
                 'type', 'FeatureCollection',
                 'features',
-                    (
-                        SELECT
-                            json_agg(
-                                json_build_object(
-                                    'type', 'Feature',
-                                    'id', :id_column,
-                                    'geometry', :geometry_q,
-                                    'properties', to_jsonb( features.* ) - :geom_columns::text[]
-                                )
+                (
+                    SELECT
+                        json_agg(
+                            json_build_object(
+                                'type', 'Feature',
+                                'id', :id_column,
+                                'geometry', :geometry_q,
+                                'properties', to_jsonb( features.* ) - :geom_columns::text[]
                             )
-                        FROM features
-                    ),
-                'total_count',
-                    (
-                        SELECT count FROM total_count
-                    )
+                        )
+                    FROM features
                 )
-            ;
+            );
         """
         id_column = logic.V(self.id_column) or pg_funcs.cast(None, "text")
         geom_columns = [g.name for g in self.geometry_columns]
@@ -440,15 +445,6 @@ class Table(CollectionLayer, DBTable):
                 limit=limit,
                 offset=offset,
             ),
-            count_q=self._features_count_query(
-                ids_filter=ids_filter,
-                bbox_filter=bbox_filter,
-                datetime_filter=datetime_filter,
-                properties_filter=properties_filter,
-                cql_filter=cql_filter,
-                geom=geom,
-                dt=dt,
-            ),
             id_column=id_column,
             geometry_q=self._geom(
                 geometry_column=self.get_geometry_column(geom),
@@ -460,10 +456,36 @@ class Table(CollectionLayer, DBTable):
         async with pool.acquire() as conn:
             items = await conn.fetchval(q, *p)
 
-        return (
-            {"type": "FeatureCollection", "features": items.get("features") or []},
-            items["total_count"],
+        if not items.get("features"):
+            return {"type": "FeatureCollection", "features": []}
+
+        return items
+
+    async def count(
+        self,
+        pool: asyncpg.BuildPgPool,
+        ids_filter: Optional[List[str]] = None,
+        bbox_filter: Optional[List[float]] = None,
+        datetime_filter: Optional[List[str]] = None,
+        properties_filter: Optional[List[Tuple[str, str]]] = None,
+        cql_filter: Optional[AstType] = None,
+        geom: str = None,
+        dt: str = None,
+    ) -> int:
+        """Return a Count of matched items for a query."""
+        c = self._features_count_query(
+            ids_filter=ids_filter,
+            bbox_filter=bbox_filter,
+            datetime_filter=datetime_filter,
+            properties_filter=properties_filter,
+            cql_filter=cql_filter,
+            geom=geom,
+            dt=dt,
         )
+        q, p = render(":c", c=c)
+        async with pool.acquire() as conn:
+            count = await conn.fetchval(q, *p)
+            return count
 
     async def features(
         self,
@@ -477,9 +499,9 @@ class Table(CollectionLayer, DBTable):
         limit: Optional[int] = None,
         offset: Optional[int] = None,
         **kwargs: Any,
-    ) -> Tuple[FeatureCollection, int]:
+    ) -> FeatureCollection:
         """Return a FeatureCollection and the number of matched items."""
-        return await self.query(
+        return await self._features(
             pool=pool,
             ids_filter=ids_filter,
             bbox_filter=bbox_filter,
@@ -500,7 +522,7 @@ class Table(CollectionLayer, DBTable):
         **kwargs: Any,
     ) -> Optional[Feature]:
         """Return a Feature."""
-        feature_collection, _ = await self.query(
+        feature_collection = await self._features(
             pool=pool,
             ids_filter=[item_id],
             properties=properties,
@@ -563,6 +585,19 @@ class Function(CollectionLayer):
 
         return cls(id=id, sql=sql, **kwargs)
 
+    async def count(
+        self,
+        pool: asyncpg.BuildPgPool,
+        ids_filter: Optional[List[str]] = None,
+        bbox_filter: Optional[List[float]] = None,
+        datetime_filter: Optional[List[str]] = None,
+        properties_filter: Optional[List[Tuple[str, str]]] = None,
+        cql_filter: Optional[AstType] = None,
+    ) -> int:
+        """Return a Count of matched items for a query."""
+        # TODO
+        pass
+
     async def features(
         self,
         pool: asyncpg.BuildPgPool,
@@ -575,7 +610,7 @@ class Function(CollectionLayer):
         limit: Optional[int] = None,
         offset: Optional[int] = None,
         **kwargs: Any,
-    ) -> Tuple[FeatureCollection, int]:
+    ) -> FeatureCollection:
         """Return a FeatureCollection and the number of matched items."""
         # TODO
         pass

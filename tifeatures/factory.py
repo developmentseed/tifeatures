@@ -625,7 +625,7 @@ class Endpoints:
                 if key.lower() not in exclude and key.lower() in table_property
             ]
 
-            items, matched_items = await collection.features(
+            items = await collection.features(
                 request.app.state.pool,
                 ids_filter=ids_filter,
                 bbox_filter=bbox_filter,
@@ -715,6 +715,17 @@ class Endpoints:
             ]
 
             items_returned = len(items["features"])
+
+            matched_items = await collection.count(
+                request.app.state.pool,
+                ids_filter=ids_filter,
+                bbox_filter=bbox_filter,
+                datetime_filter=datetime_filter,
+                properties_filter=properties_filter,
+                cql_filter=cql_filter,
+                geom=geom_column,
+                dt=datetime_column,
+            )
 
             if (matched_items - items_returned) > offset:
                 next_offset = offset + items_returned
