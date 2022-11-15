@@ -3,12 +3,14 @@
 import csv
 import json
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Generator, Iterable, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import jinja2
+import orjson
 from pygeofilter.ast import AstType
 
 from tifeatures import model
+from tifeatures.dbmodel import GeometryColumn
 from tifeatures.dependencies import (
     CollectionParams,
     ItemOutputType,
@@ -18,6 +20,7 @@ from tifeatures.dependencies import (
     bbox_query,
     datetime_query,
     filter_query,
+    geom_col,
     ids_query,
     properties_query,
     sortby_query,
@@ -45,7 +48,7 @@ DEFAULT_TEMPLATES = Jinja2Templates(
 )
 
 
-def create_csv_rows(data: Iterable[Dict]) -> Generator[str, None, None]:
+async def create_csv_rows(data):
     """Creates an iterator that returns lines of csv from an iterable of dicts."""
 
     class DummyWriter:
@@ -56,7 +59,7 @@ def create_csv_rows(data: Iterable[Dict]) -> Generator[str, None, None]:
             return line
 
     # Get the first row and construct the column names
-    row = next(data)  # type: ignore
+    row = await data.__anext__()  # type: ignore
     fieldnames = row.keys()
     writer = csv.DictWriter(DummyWriter(), fieldnames=fieldnames)
 
@@ -67,8 +70,40 @@ def create_csv_rows(data: Iterable[Dict]) -> Generator[str, None, None]:
     yield writer.writerow(row)
 
     # Write all remaining rows
-    for row in data:
+    async for row in data:
         yield writer.writerow(row)
+
+
+def create_geojson_feature(item: Dict, geometry_column: Optional[str]) -> Dict:
+    """Creates an iterator that returns geojson features from an iterable of dicts."""
+    geom = item.pop("tifeatures_geom")
+    if geom:
+        geomout = geom
+    else:
+        geomout = None
+    id = item.pop("tifeatures_id")
+    return {
+        "type": "Feature",
+        "id": id,
+        "geometry": geomout,
+        "properties": item,
+    }
+
+
+def create_wkt_feature(item: Dict, geometry_column: Optional[str]) -> Dict:
+    """Creates an iterator that returns geojson features from an iterable of dicts."""
+    geom = item.pop("tifeatures_geom")
+    if geom:
+        geomout = geom
+    else:
+        geomout = None
+    id = item.pop("tifeatures_id")
+    return {
+        "type": "Feature",
+        "id": id,
+        "geometry": geomout,
+        "properties": item,
+    }
 
 
 @dataclass
@@ -543,7 +578,7 @@ class Endpoints:
 
         @self.router.get(
             "/collections/{collectionId}/items",
-            response_model=model.Items,
+            # response_model=model.Items,
             response_model_exclude_none=True,
             response_class=GeoJSONResponse,
             responses={
@@ -568,11 +603,7 @@ class Endpoints:
             properties: Optional[List[str]] = Depends(properties_query),
             cql_filter: Optional[AstType] = Depends(filter_query),
             sortby: Optional[str] = Depends(sortby_query),
-            geom_column: Optional[str] = Query(
-                None,
-                description="Select geometry column.",
-                alias="geom-column",
-            ),
+            geom_column: Optional[GeometryColumn] = Depends(geom_col),
             datetime_column: Optional[str] = Query(
                 None,
                 description="Select datetime column.",
@@ -625,53 +656,48 @@ class Endpoints:
                 if key.lower() not in exclude and key.lower() in table_property
             ]
 
-            items, matched_items = await collection.features(
-                request.app.state.pool,
-                ids_filter=ids_filter,
-                bbox_filter=bbox_filter,
-                datetime_filter=datetime_filter,
-                properties_filter=properties_filter,
-                cql_filter=cql_filter,
+            if geom_column:
+                geom_col_name = geom_column.name
+            else:
+                geom_col_name = None
+
+            _from = collection._from()
+            _where = collection._where(
+                ids=ids_filter,
+                datetime=datetime_filter,
+                bbox=bbox_filter,
+                properties=properties_filter,
+                cql=cql_filter,
+                geom=geom_col_name,
+                dt=datetime_filter,
+            )
+
+            features = collection._features(
+                pool=request.app.state.pool,
+                _from=_from,
+                _where=_where,
                 sortby=sortby,
                 properties=properties,
                 limit=limit,
                 offset=offset,
-                geom=geom_column,
-                dt=datetime_column,
+                geometry_column=geom_column,
                 bbox_only=bbox_only,
                 simplify=simplify,
             )
 
-            if output_type in (
+            if output_type in [
                 MediaType.csv,
                 MediaType.json,
                 MediaType.ndjson,
-            ):
-                if items and items[0].geometry is not None:
-                    rows = (
-                        {
-                            "collectionId": collection.id,
-                            "itemId": f.id,
-                            **f.properties,
-                            "geometry": f.geometry.wkt,
-                        }
-                        for f in items
-                    )
-
-                else:
-                    rows = (
-                        {
-                            "collectionId": collection.id,
-                            "itemId": f.id,
-                            **f.properties,
-                        }
-                        for f in items
-                    )
-
+            ]:
+                items = (
+                    create_wkt_feature(feature, geom_col_name)
+                    async for feature in features
+                )
                 # CSV Response
                 if output_type == MediaType.csv:
                     return StreamingResponse(
-                        create_csv_rows(rows),
+                        create_csv_rows(items),
                         media_type=MediaType.csv,
                         headers={
                             "Content-Disposition": "attachment;filename=items.csv"
@@ -680,17 +706,34 @@ class Endpoints:
 
                 # JSON Response
                 if output_type == MediaType.json:
-                    return JSONResponse([row for row in rows])
+                    return JSONResponse([item async for item in items])
 
                 # NDJSON Response
                 if output_type == MediaType.ndjson:
                     return StreamingResponse(
-                        (json.dumps(row) + "\n" for row in rows),
+                        (orjson.dumps(item) + b"\n" async for item in items),
                         media_type=MediaType.ndjson,
                         headers={
                             "Content-Disposition": "attachment;filename=items.ndjson"
                         },
                     )
+
+            matched_items = await collection._features_count(
+                pool=request.app.state.pool, _from=_from, _where=_where
+            )
+            items = (
+                create_geojson_feature(feature, geom_col_name)
+                async for feature in features
+            )
+
+            if output_type == MediaType.geojsonseq:
+                return StreamingResponse(
+                    (orjson.dumps(item) async for item in items),
+                    media_type=MediaType.geojsonseq,
+                    headers={
+                        "Content-Disposition": "attachment;filename=items.geojson"
+                    },
+                )
 
             qs = "?" + str(request.query_params) if request.query_params else ""
             links = [
@@ -711,7 +754,9 @@ class Endpoints:
                 ),
             ]
 
+            items = [item async for item in items]
             items_returned = len(items)
+            print(f"items_returned {items_returned}")
 
             if (matched_items - items_returned) > offset:
                 next_offset = offset + items_returned
@@ -753,62 +798,24 @@ class Endpoints:
                     ),
                 )
 
-            data = model.Items(
-                id=collection.id,
-                title=collection.title or collection.id,
-                description=collection.description or collection.title or collection.id,
-                numberMatched=matched_items,
-                numberReturned=items_returned,
-                links=links,
-                features=[
-                    model.Item(
-                        **{
-                            **feature.dict(),
-                            "links": [
-                                model.Link(
-                                    title="Collection",
-                                    href=self.url_for(
-                                        request,
-                                        "collection",
-                                        collectionId=collection.id,
-                                    ),
-                                    rel="collection",
-                                    type=MediaType.json,
-                                ),
-                                model.Link(
-                                    title="Item",
-                                    href=self.url_for(
-                                        request,
-                                        "item",
-                                        collectionId=collection.id,
-                                        itemId=feature.id,
-                                    ),
-                                    rel="item",
-                                    type=MediaType.json,
-                                ),
-                            ],
-                        }
-                    )
-                    for feature in items
-                ],
-            )
+            data = {
+                "id": collection.id,
+                "title": collection.title or collection.id,
+                "description": collection.description
+                or collection.title
+                or collection.id,
+                "numberMatched": matched_items,
+                "numberReturned": items_returned,
+                "links": [link.dict() for link in links],
+                "features": items,
+            }
 
             # HTML Response
             if output_type == MediaType.html:
                 return self._create_html_response(
                     request,
-                    data.json(exclude_none=True),
+                    orjson.dumps(data),
                     template_name="items",
-                )
-
-            # GeoJSONSeq Response
-            elif output_type == MediaType.geojsonseq:
-                return StreamingResponse(
-                    data.json_seq(exclude_none=True),
-                    media_type=MediaType.geojsonseq,
-                    headers={
-                        "Content-Disposition": "attachment;filename=items.geojson"
-                    },
                 )
 
             # Default to GeoJSON Response

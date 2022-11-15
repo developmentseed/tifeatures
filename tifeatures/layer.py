@@ -5,7 +5,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, ClassVar, Dict, List, Optional, Tuple
 
-from buildpg import asyncpg, clauses
+from buildpg import RawDangerous, asyncpg, clauses
 from buildpg import funcs as pg_funcs
 from buildpg import logic, render
 from ciso8601 import parse_rfc3339
@@ -24,6 +24,7 @@ from tifeatures.errors import (
 )
 from tifeatures.filter.evaluate import to_filter
 from tifeatures.filter.filters import bbox_to_wkt
+from tifeatures.resources.enums import MediaType
 
 # Links to geojson schema
 geojson_schema = {
@@ -120,8 +121,45 @@ class Table(CollectionLayer, DBTable):
 
         return values
 
-    def _select(self, properties: Optional[List[str]]):
-        return clauses.Select(self.columns(properties))
+    def _select(
+        self,
+        properties: Optional[List[str]],
+        geometry_column: Optional[GeometryColumn],
+        bbox_only: Optional[bool],
+        simplify: Optional[float],
+        media_type: MediaType = MediaType.geojson,
+    ):
+        columns = self.columns(properties)
+        if columns:
+            sel = clauses.Select(columns) + RawDangerous(",")
+        else:
+            sel = RawDangerous("SELECT ")
+
+        if self.id_column:
+            sel = sel + logic.V(self.id_column) + RawDangerous(" AS tifeatures_id, ")
+        else:
+            sel = sel + RawDangerous(" ROW_NUMBER () OVER () AS tifeatures_id, ")
+
+        geom = self._geom(geometry_column, bbox_only, simplify)
+        if media_type in [MediaType.geojson, MediaType.geojsonseq]:
+            if geom:
+                sel = (
+                    sel
+                    + pg_funcs.cast(logic.Func("st_asgeojson", geom), "json")
+                    + RawDangerous(" AS tifeatures_geom ")
+                )
+            else:
+                sel = sel + RawDangerous(" NULL::json AS tifeatures_geom ")
+        else:
+            if geom:
+                sel = (
+                    sel
+                    + logic.Func("st_asgeojson", geom)
+                    + RawDangerous(" AS tifeatures_geom ")
+                )
+            else:
+                sel = sel + RawDangerous(" NULL::text AS tifeatures_geom ")
+        return sel
 
     def _select_count(self):
         return clauses.Select(pg_funcs.count("*"))
@@ -136,7 +174,7 @@ class Table(CollectionLayer, DBTable):
         simplify: Optional[float],
     ):
         if geometry_column is None:
-            return pg_funcs.cast(None, "jsonb")
+            return pg_funcs.cast(None, "geometry")
 
         g = logic.V(geometry_column.name)
         g = pg_funcs.cast(g, "geometry")
@@ -153,9 +191,7 @@ class Table(CollectionLayer, DBTable):
                 simplify,
             )
 
-        g = logic.Func("ST_AsGeoJson", g)
-
-        return pg_funcs.cast(g, "jsonb")
+        return g
 
     def _where(
         self,
@@ -328,31 +364,47 @@ class Table(CollectionLayer, DBTable):
             + clauses.Offset(offset or 0)
         )
 
-    def _features_count_query(
+    async def _features_count(self, pool: asyncpg.BuildPgPool, _from, _where):
+        """Build features COUNT query."""
+        c = self._select_count() + _from + _where
+        q, p = render(":c", c=c)
+        async with pool.acquire() as conn:
+            count = await conn.fetchval(q, *p)
+            return count
+
+    async def _features(
         self,
-        *,
-        ids_filter: Optional[List[str]] = None,
-        bbox_filter: Optional[List[float]] = None,
-        datetime_filter: Optional[List[str]] = None,
-        properties_filter: Optional[List[Tuple[str, str]]] = None,
-        cql_filter: Optional[AstType] = None,
-        geom: str = None,
-        dt: str = None,
+        pool: asyncpg.BuildPgPool,
+        _from,
+        _where,
+        sortby: Optional[str] = None,
+        properties: Optional[List[str]] = None,
+        limit: Optional[int] = None,
+        offset: Optional[int] = None,
+        geometry_column=None,
+        bbox_only=None,
+        simplify=None,
     ):
         """Build features COUNT query."""
-        return (
-            self._select_count()
-            + self._from()
-            + self._where(
-                ids=ids_filter,
-                datetime=datetime_filter,
-                bbox=bbox_filter,
-                properties=properties_filter,
-                cql=cql_filter,
-                geom=geom,
-                dt=dt,
+        c = (
+            self._select(
+                properties=properties,
+                geometry_column=geometry_column,
+                bbox_only=bbox_only,
+                simplify=simplify,
             )
+            + _from
+            + _where
+            + self._sortby(sortby)
+            + clauses.Limit(limit or 10)
+            + clauses.Offset(offset or 0)
         )
+        q, p = render(":c", c=c)
+        print(q, p)
+        async with pool.acquire() as conn:
+            for r in await conn.fetch(q, *p):
+                properties = dict(r)
+                yield properties
 
     async def query(
         self,
@@ -373,80 +425,34 @@ class Table(CollectionLayer, DBTable):
         simplify: Optional[float] = None,
     ) -> Tuple[FeatureCollection, int]:
         """Build and run Pg query."""
-        if geom and geom.lower() != "none" and not self.get_geometry_column(geom):
+        geom_col = self.get_geometry_column(geom)
+
+        if geom and geom.lower() != "none" and not geom_col:
             raise InvalidGeometryColumnName(f"Invalid Geometry Column: {geom}.")
 
-        sql_query = """
-            WITH
-                features AS (
-                    :features_q
-                ),
-                total_count AS (
-                    :count_q
-                )
-            SELECT json_build_object(
-                'type', 'FeatureCollection',
-                'features',
-                    (
-                        SELECT
-                            json_agg(
-                                json_build_object(
-                                    'type', 'Feature',
-                                    'id', :id_column,
-                                    'geometry', :geometry_q,
-                                    'properties', to_jsonb( features.* ) - :geom_columns::text[]
-                                )
-                            )
-                        FROM features
-                    ),
-                'total_count',
-                    (
-                        SELECT count FROM total_count
-                    )
-                )
-            ;
-        """
-        id_column = logic.V(self.id_column) or pg_funcs.cast(None, "text")
-        geom_columns = [g.name for g in self.geometry_columns]
-        q, p = render(
-            sql_query,
-            features_q=self._features_query(
-                ids_filter=ids_filter,
-                bbox_filter=bbox_filter,
-                datetime_filter=datetime_filter,
-                properties_filter=properties_filter,
-                cql_filter=cql_filter,
-                sortby=sortby,
-                properties=properties,
-                geom=geom,
-                dt=dt,
-                limit=limit,
-                offset=offset,
-            ),
-            count_q=self._features_count_query(
-                ids_filter=ids_filter,
-                bbox_filter=bbox_filter,
-                datetime_filter=datetime_filter,
-                properties_filter=properties_filter,
-                cql_filter=cql_filter,
-                geom=geom,
-                dt=dt,
-            ),
-            id_column=id_column,
-            geometry_q=self._geom(
-                geometry_column=self.get_geometry_column(geom),
-                bbox_only=bbox_only,
-                simplify=simplify,
-            ),
-            geom_columns=geom_columns,
-        )
-        async with pool.acquire() as conn:
-            items = await conn.fetchval(q, *p)
+        if geom_col:
+            geom_col_name = geom_col.name
+        else:
+            geom_col_name = None
 
-        return (
-            FeatureCollection(features=items.get("features") or []),
-            items["total_count"],
+        _from = self._from()
+        _where = self._where()
+
+        # Get count
+
+        pgfeatures = self._features(
+            pool=pool,
+            _from=_from,
+            _where=_where,
+            geom_col_name=geom_col_name,
+            id_column=self.id_column,
+            sortby=sortby,
+            properties=properties,
+            limit=limit,
+            offset=offset,
         )
+
+        return pgfeatures
 
     async def features(
         self,
@@ -460,7 +466,7 @@ class Table(CollectionLayer, DBTable):
         limit: Optional[int] = None,
         offset: Optional[int] = None,
         **kwargs: Any,
-    ) -> Tuple[FeatureCollection, int]:
+    ):
         """Return a FeatureCollection and the number of matched items."""
         return await self.query(
             pool=pool,
@@ -481,7 +487,7 @@ class Table(CollectionLayer, DBTable):
         item_id: str,
         properties: Optional[List[str]] = None,
         **kwargs: Any,
-    ) -> Optional[Feature]:
+    ):
         """Return a Feature."""
         feature_collection, _ = await self.query(
             pool=pool,
@@ -489,10 +495,10 @@ class Table(CollectionLayer, DBTable):
             properties=properties,
             **kwargs,
         )
-        if len(feature_collection):
-            return feature_collection.features[0]
-
-        return None
+        try:
+            return await feature_collection.__anext__()
+        except:
+            return None
 
     @property
     def queryables(self) -> Dict:
