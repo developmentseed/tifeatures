@@ -1,5 +1,9 @@
 # Release Notes
 
+## 0.1.0a3 (2023-02-27)
+
+* fix CRS for collection and extent (switch from `epsg4326` to `CRS84`)
+
 ## 0.1.0a2 (2022-11-21)
 
 * fix package metadata
