@@ -346,7 +346,7 @@ class Endpoints:
                             "extent": model.Extent(
                                 spatial=model.Spatial(
                                     bbox=[collection.bounds],
-                                    crs=collection.crs,
+                                    crs="http://www.opengis.net/def/crs/OGC/1.3/CRS84",
                                 )
                                 if collection.bounds is not None
                                 else None
@@ -425,7 +425,7 @@ class Endpoints:
                 collection_data["extent"] = model.Extent(
                     spatial=model.Spatial(
                         bbox=[collection.bounds],
-                        crs=collection.crs,
+                        crs="http://www.opengis.net/def/crs/OGC/1.3/CRS84",
                     )
                 )
 
