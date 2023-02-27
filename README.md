@@ -26,7 +26,15 @@
 
 ---
 
+> :warning: This project is on pause while we focus on [`developmentseed/tipg`](https://github.com/developmentseed/tipg) :warning:
+>
+>  ref: https://github.com/developmentseed/timvt/discussions/96
+
+---
+
 `TiFeatures`, pronounced *T[ee]Features*, is a **python** package which helps creating lightweight **Features** server for PostGIS Database. The API has been designed with respect to [OGC Features API specification](https://github.com/opengeospatial/ogcapi-features).
+
+---
 
 ## Install
 

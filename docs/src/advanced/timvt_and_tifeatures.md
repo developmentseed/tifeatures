@@ -1,4 +1,7 @@
 
+!!! Note
+    Please checkout the [`developmentseed/tipg`](https://github.com/developmentseed/tipg) which is the result of the merge between tifeatures and timvt.
+
 
 `TiFeatures` and [`TiMVT`](https://github.com/developmentseed/timvt) share a lot of in common and it's possible to create a unique FastAPI application with both **Features** and **MVT** endpoints:
 
