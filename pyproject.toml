@@ -40,6 +40,7 @@ test = [
     "pytest-cov",
     "pytest-asyncio",
     "pytest-benchmark",
+    "sqlalchemy>=1.1,<1.4",
     "httpx",
     "psycopg2",
     "pytest-pgsql",
