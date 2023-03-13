@@ -52,7 +52,11 @@ def create_csv_rows(data: Iterable[Dict]) -> Generator[str, None, None]:
             return line
 
     # Get the first row and construct the column names
-    row = next(data)  # type: ignore
+    try:
+        row = next(data)  # type: ignore
+    except StopIteration:
+        return None
+
     fieldnames = row.keys()
     writer = csv.DictWriter(DummyWriter(), fieldnames=fieldnames)
 
