@@ -1,5 +1,9 @@
 # Release Notes
 
+## 0.1.0a4 (2023-03-15)
+
+* fix factories `url_for` type (for starlette >=0.26)
+
 ## 0.1.0a3 (2023-02-27)
 
 * fix CRS for collection and extent (switch from `epsg4326` to `CRS84`)
